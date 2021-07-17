@@ -322,8 +322,8 @@ typedef struct _TYPESPEC_ROW
 typedef struct _TYPEREF_ROW
 {
   DWORD ResolutionScope;
-  DWORD TypeName;
-  DWORD TypeNamespace;
+  DWORD Name;
+  DWORD Namespace;
 } TYPEREF_ROW, *PTYPEREF_ROW;
 
 typedef struct _INTERFACEIMPL_ROW
@@ -331,6 +331,16 @@ typedef struct _INTERFACEIMPL_ROW
   DWORD Class;
   DWORD Interface;
 } INTERFACEIMPL_ROW, *PINTERFACEIMPL_ROW;
+
+typedef struct _METHODDEF_ROW // ECMA 335 II.22.26 
+{
+  DWORD Rva;
+  WORD ImplFlags;
+  WORD Flags;
+  DWORD Name;
+  DWORD Signature;
+  DWORD ParamList;
+} METHODDEF_ROW, *PMETHODDEF_ROW;
 
 // Used to return offsets to the various headers.
 typedef struct _STREAMS

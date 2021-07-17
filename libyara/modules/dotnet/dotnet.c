@@ -52,6 +52,7 @@ static uint32_t max_rows(int count, ...)
   return biggest;
 }
 
+// endianess aware
 static uint32_t read_u32(const uint8_t** data)
 {
   uint32_t result = yr_le32toh(*(uint32_t*) *data);
@@ -59,6 +60,7 @@ static uint32_t read_u32(const uint8_t** data)
   return result;
 }
 
+// endianess aware
 static uint16_t read_u16(const uint8_t** data)
 {
   uint16_t result = yr_le16toh(*(uint16_t*) *data);
@@ -66,6 +68,7 @@ static uint16_t read_u16(const uint8_t** data)
   return result;
 }
 
+// endianess aware
 static uint32_t read_index(const uint8_t** data, unsigned len)
 {
   if (len == 2)
@@ -157,7 +160,7 @@ static const char* get_type_attr_str(uint32_t flags)
   }
 }
 
-void read_typedef_row(
+void read_typedef(
     const uint8_t* data,
     const TABLES* tables,
     const INDEX_SIZES* index_sizes,
@@ -181,7 +184,7 @@ void read_typedef_row(
   result->Method = read_index(&data, index_sizes->methoddef);
 }
 
-void read_typeref_row(
+void read_typeref(
     const uint8_t* data,
     const TABLES* tables,
     const INDEX_SIZES* index_sizes,
@@ -199,11 +202,11 @@ void read_typeref_row(
     res_scope_size = 4;
 
   result->ResolutionScope = read_index(&data, res_scope_size);
-  result->TypeName = read_index(&data, index_sizes->string);
-  result->TypeNamespace = read_index(&data, index_sizes->string);
+  result->Name = read_index(&data, index_sizes->string);
+  result->Namespace = read_index(&data, index_sizes->string);
 }
 
-void read_interfaceimpl_row(
+void read_interfaceimpl(
     const uint8_t* data,
     const TABLES* tables,
     const INDEX_SIZES* index_sizes,
@@ -221,6 +224,19 @@ void read_interfaceimpl_row(
 
   result->Class = read_index(&data, index_sizes->typedef_);
   result->Interface = read_index(&data, interface_size);
+}
+
+void read_methoddef(
+    const uint8_t* data,
+    const INDEX_SIZES* index_sizes,
+    METHODDEF_ROW* result)
+{
+  result->Rva = read_u32(&data);
+  result->ImplFlags = read_u16(&data);
+  result->Flags = read_u16(&data);
+  result->Name = read_index(&data, index_sizes->string);
+  result->Signature = read_index(&data, index_sizes->blob);
+  result->ParamList = read_index(&data, index_sizes->param);
 }
 
 static char* get_type_def_or_ref_fullname(
@@ -250,7 +266,7 @@ static char* get_type_def_or_ref_fullname(
   {
   case 0x0:  // TypeDef index EMCA 335 II.22.37
     data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
-    read_typedef_row(data, tables, index_sizes, &def_row);
+    read_typedef(data, tables, index_sizes, &def_row);
 
     name = pe_get_dotnet_string(pe, str_heap, def_row.Name);
     namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
@@ -261,10 +277,10 @@ static char* get_type_def_or_ref_fullname(
 
   case 0x1:  // TypeRef index EMCA 335 II.22.38
     data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
-    read_typeref_row(data, tables, index_sizes, &ref_row);
+    read_typeref(data, tables, index_sizes, &ref_row);
 
-    name = pe_get_dotnet_string(pe, str_heap, ref_row.TypeName);
-    namespace = pe_get_dotnet_string(pe, str_heap, ref_row.TypeNamespace);
+    name = pe_get_dotnet_string(pe, str_heap, ref_row.Name);
+    namespace = pe_get_dotnet_string(pe, str_heap, ref_row.Namespace);
 
     return create_full_name(name, namespace);
 
@@ -279,6 +295,8 @@ static char* get_type_def_or_ref_fullname(
   default:
     break;
   }
+
+  return NULL;
 }
 
 static void dotnet_get_type_parents(
@@ -303,13 +321,15 @@ static void dotnet_get_type_parents(
         "classes[%i].base_types[%i]",
         type_idx - 1,
         base_type_idx++);
+  yr_free(fullname);
 
   // linear search for every interface that the class implements
   for (uint32_t i = 0; i < tables->intefaceimpl.RowCount; i++)
   {
     data = tables->intefaceimpl.Offset + tables->intefaceimpl.RowSize * i;
-    read_interfaceimpl_row(data, tables, index_sizes, &row);
+    read_interfaceimpl(data, tables, index_sizes, &row);
 
+    // + 1 due tables using 1-based indexing
     if (row.Class == type_idx + 1)
     {
       fullname = get_type_def_or_ref_fullname(
@@ -320,11 +340,39 @@ static void dotnet_get_type_parents(
           "classes[%i].base_types[%i]",
           type_idx - 1,
           base_type_idx++);
+      yr_free(fullname);
     }
   }
 }
 
-void dotnet_parse_classes(
+void dotnet_parse_class_methods(
+    PE* pe,
+    TABLES* tables,
+    STREAMS* streams,
+    INDEX_SIZES* index_sizes,
+    uint32_t methodlist,
+    unsigned type_idx)
+{
+  // Method list can be NULL
+  if (!methodlist) {
+    return;
+  }
+
+  // For now try the first method TODO
+  const uint8_t* str_heap = pe->data + streams->metadata_root +
+                            streams->string->Offset;
+  const uint8_t* data = tables->methoddef.Offset +
+                        tables->methoddef.RowSize * (methodlist - 1);
+
+  METHODDEF_ROW row;
+  read_methoddef(data, index_sizes, &row);
+  char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+  if (name)
+    set_string(name, pe->object, "classes[%i].methods[0].name", type_idx - 1);
+}
+
+// Reads TypeDef table and reconstructs types with their methods
+void dotnet_parse_user_types(
     PE* pe,
     TABLES* tables,
     INDEX_SIZES* index_sizes,
@@ -352,7 +400,7 @@ void dotnet_parse_classes(
                           tables->typedef_.RowSize * type_idx;
 
     TYPEDEF_ROW row;
-    read_typedef_row(data, tables, index_sizes, &row);
+    read_typedef(data, tables, index_sizes, &row);
 
     char* class_name = pe_get_dotnet_string(pe, str_heap, row.Name);
     char* class_namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
@@ -367,14 +415,21 @@ void dotnet_parse_classes(
     set_string(type, pe->object, "classes[%i].type", type_idx - 1);
 
     set_integer(
-        (row.Flags & 0x80) != 0, pe->object, "classes[%i].abstract", type_idx - 1);
+        (row.Flags & 0x80) != 0,
+        pe->object,
+        "classes[%i].abstract",
+        type_idx - 1);
     set_integer(
-        (row.Flags & 0x100) != 0, pe->object, "classes[%i].sealed", type_idx - 1);
+        (row.Flags & 0x100) != 0,
+        pe->object,
+        "classes[%i].sealed",
+        type_idx - 1);
 
     dotnet_get_type_parents(
         pe, tables, streams, index_sizes, row.Extends, type_idx);
 
-    // dotnet_get_class_methods();
+    dotnet_parse_class_methods(
+        pe, tables, streams, index_sizes, row.Method, type_idx);
   }
 }
 
@@ -1796,7 +1851,7 @@ void dotnet_parse_tilde_2(
     matched_bits++;
   }
 
-  dotnet_parse_classes(pe, &tables, &index_sizes, streams);
+  dotnet_parse_user_types(pe, &tables, &index_sizes, streams);
 }
 
 // Parsing the #~ stream is done in two parts. The first part (this function)
