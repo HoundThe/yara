@@ -1,4 +1,5 @@
 import "pe"
+import "dotnet"
 
 rule UPX : Packer
 {

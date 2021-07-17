@@ -305,9 +305,37 @@ typedef struct _CONSTANT_TABLE
   } Value;
 } CONSTANT_TABLE, *PCONSTANT_TABLE;
 
+typedef struct _TYPEDEF_ROW
+{
+  DWORD Flags;
+  DWORD Name;
+  DWORD Namespace;
+  DWORD Extends;
+  DWORD Field;
+  DWORD Method;
+} TYPEDEF_ROW, *PTYPEDEF_ROW;
+typedef struct _TYPESPEC_ROW
+{
+  DWORD Signature;
+} TYPESPEC_ROW, *PTYPESPEC_ROW;
+
+typedef struct _TYPEREF_ROW
+{
+  DWORD ResolutionScope;
+  DWORD TypeName;
+  DWORD TypeNamespace;
+} TYPEREF_ROW, *PTYPEREF_ROW;
+
+typedef struct _INTERFACEIMPL_ROW
+{
+  DWORD Class;
+  DWORD Interface;
+} INTERFACEIMPL_ROW, *PINTERFACEIMPL_ROW;
+
 // Used to return offsets to the various headers.
 typedef struct _STREAMS
 {
+  int64_t metadata_root;  // base from which are stream offsets relative
   PSTREAM_HEADER guid;
   PSTREAM_HEADER tilde;
   PSTREAM_HEADER string;
@@ -322,6 +350,25 @@ typedef struct _BLOB_PARSE_RESULT
   uint8_t size;  // Number of bytes parsed. This is the new offset.
   DWORD length;  // Value of the bytes parsed. This is the blob length.
 } BLOB_PARSE_RESULT, *PBLOB_PARSE_RESULT;
+
+typedef struct _TABLE_INFO
+{
+  uint8_t* Offset;
+  uint32_t RowCount;
+  uint32_t RowSize;
+} TABLE_INFO, *PTABLE_INFO;
+typedef struct _TABLES
+{
+  TABLE_INFO typedef_;
+  TABLE_INFO typespec;
+  TABLE_INFO typeref;
+  TABLE_INFO methoddef;
+  TABLE_INFO module;
+  TABLE_INFO moduleref;
+  TABLE_INFO assembly;
+  TABLE_INFO assemblyref;
+  TABLE_INFO intefaceimpl;
+} TABLES, *PTABLES;
 
 // Used to store the number of rows of each table.
 typedef struct _ROWS
@@ -358,14 +405,20 @@ typedef struct _INDEX_SIZES
   uint8_t blob;
   uint8_t field;
   uint8_t methoddef;
+  uint8_t methodspec;
   uint8_t memberref;
   uint8_t param;
   uint8_t event;
   uint8_t typedef_;
+  uint8_t typeref;
+  uint8_t typespec;
+  uint8_t interfaceimpl;
   uint8_t property;
   uint8_t moduleref;
+  uint8_t module;
   uint8_t assemblyrefprocessor;
   uint8_t assemblyref;
+  uint8_t assembly;
   uint8_t genericparam;
 } INDEX_SIZES, *PINDEX_SIZES;
 

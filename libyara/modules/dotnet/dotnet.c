@@ -16,7 +16,9 @@ limitations under the License.
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <yara/dotnet.h>
 #include <yara/mem.h>
@@ -26,6 +28,51 @@ limitations under the License.
 #include <yara/strutils.h>
 
 #define MODULE_NAME dotnet
+
+static uint32_t max_rows(int count, ...)
+{
+  va_list ap;
+  int i;
+  uint32_t biggest;
+  uint32_t x;
+
+  if (count == 0)
+    return 0;
+
+  va_start(ap, count);
+  biggest = va_arg(ap, uint32_t);
+
+  for (i = 1; i < count; i++)
+  {
+    x = va_arg(ap, uint32_t);
+    biggest = (x > biggest) ? x : biggest;
+  }
+
+  va_end(ap);
+  return biggest;
+}
+
+static uint32_t read_u32(const uint8_t** data)
+{
+  uint32_t result = yr_le32toh(*(uint32_t*) *data);
+  *data += sizeof(uint32_t);
+  return result;
+}
+
+static uint16_t read_u16(const uint8_t** data)
+{
+  uint16_t result = yr_le16toh(*(uint16_t*) *data);
+  *data += sizeof(uint16_t);
+  return result;
+}
+
+static uint32_t read_index(const uint8_t** data, unsigned len)
+{
+  if (len == 2)
+    return read_u16(data);
+  else
+    return read_u32(data);
+}
 
 char* pe_get_dotnet_string(
     PE* pe,
@@ -55,27 +102,280 @@ char* pe_get_dotnet_string(
   return start;
 }
 
-uint32_t max_rows(int count, ...)
+// returns visibility string literal
+static const char* get_visib_attr_str(uint32_t flags)
 {
-  va_list ap;
-  int i;
-  uint32_t biggest;
-  uint32_t x;
-
-  if (count == 0)
-    return 0;
-
-  va_start(ap, count);
-  biggest = va_arg(ap, uint32_t);
-
-  for (i = 1; i < count; i++)
+  // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
+  switch (flags & 0x7)
   {
-    x = va_arg(ap, uint32_t);
-    biggest = (x > biggest) ? x : biggest;
+  case 0x0:
+  case 0x3:
+    return "private";
+  case 0x1:
+  case 0x2:
+    return "public";
+  case 0x4:
+    return "protected";
+  case 0x5:
+    return "internal";
+  case 0x6:
+    return "protected public";
+  case 0x7:
+    return "private protected";
+  default:
+    return NULL;
   }
+}
 
-  va_end(ap);
-  return biggest;
+// returns allocated string <namespace>.<name>, must be freed
+static char* create_full_name(const char* name, const char* namespace)
+{
+  size_t name_len = strlen(name);
+  size_t namespace_len = strlen(namespace);
+
+  // <namespace>.<name>
+  char* full_name = yr_malloc(namespace_len + 1 + name_len + 1);
+
+  memcpy(full_name, namespace, namespace_len);
+  full_name[namespace_len] = '.';
+  memcpy(full_name + namespace_len + 1, name, name_len + 1);
+
+  return full_name;
+}
+
+static const char* get_type_attr_str(uint32_t flags)
+{
+  // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
+  switch (flags & 0x20)
+  {
+  case 0x0:
+    return "class";
+  case 0x20:
+    return "interface";
+  default:
+    return NULL;
+  }
+}
+
+void read_typedef_row(
+    const uint8_t* data,
+    const TABLES* tables,
+    const INDEX_SIZES* index_sizes,
+    TYPEDEF_ROW* result)
+{
+  uint8_t extends_size = 2;
+  uint32_t row_count = max_rows(
+      3,
+      yr_le32toh(tables->typedef_.RowCount),
+      yr_le32toh(tables->typeref.RowCount),
+      yr_le32toh(tables->typespec.RowCount));
+
+  if (row_count > (0xFFFF >> 0x02))
+    extends_size = 4;
+
+  result->Flags = read_u32(&data);
+  result->Name = read_index(&data, index_sizes->string);
+  result->Namespace = read_index(&data, index_sizes->string);
+  result->Extends = read_index(&data, extends_size);
+  result->Field = read_index(&data, index_sizes->field);
+  result->Method = read_index(&data, index_sizes->methoddef);
+}
+
+void read_typeref_row(
+    const uint8_t* data,
+    const TABLES* tables,
+    const INDEX_SIZES* index_sizes,
+    TYPEREF_ROW* result)
+{
+  uint8_t res_scope_size = 2;
+  uint32_t row_count = max_rows(
+      4,
+      tables->module.RowCount,
+      tables->moduleref.RowCount,
+      tables->assemblyref.RowCount,
+      tables->typeref.RowCount);
+
+  if (row_count > (0xFFFF >> 0x02))
+    res_scope_size = 4;
+
+  result->ResolutionScope = read_index(&data, res_scope_size);
+  result->TypeName = read_index(&data, index_sizes->string);
+  result->TypeNamespace = read_index(&data, index_sizes->string);
+}
+
+void read_interfaceimpl_row(
+    const uint8_t* data,
+    const TABLES* tables,
+    const INDEX_SIZES* index_sizes,
+    INTERFACEIMPL_ROW* result)
+{
+  uint32_t interface_size = 2;
+  uint32_t row_count = max_rows(
+      3,
+      yr_le32toh(tables->typedef_.RowCount),
+      yr_le32toh(tables->typeref.RowCount),
+      yr_le32toh(tables->typespec.RowCount));
+
+  if (row_count > (0xFFFF >> 0x02))
+    interface_size = 4;
+
+  result->Class = read_index(&data, index_sizes->typedef_);
+  result->Interface = read_index(&data, interface_size);
+}
+
+static char* get_type_def_or_ref_fullname(
+    PE* pe,
+    TABLES* tables,
+    STREAMS* streams,
+    INDEX_SIZES* index_sizes,
+    uint32_t coded_index)
+{
+  TYPEDEF_ROW def_row;
+  TYPEREF_ROW ref_row;
+  TYPESPEC_ROW spec_row;
+
+  char *name, *namespace;
+
+  const uint8_t* data = NULL;
+  const uint8_t* str_heap = pe->data + streams->metadata_root +
+                            streams->string->Offset;
+
+  // first 2 bits define table, index starts with third bit
+  uint32_t index = coded_index >> 2;
+  // NULL index - interfaces or System.Object
+  if (!index)
+    return NULL;
+
+  switch (coded_index & 0x3)
+  {
+  case 0x0:  // TypeDef index EMCA 335 II.22.37
+    data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
+    read_typedef_row(data, tables, index_sizes, &def_row);
+
+    name = pe_get_dotnet_string(pe, str_heap, def_row.Name);
+    namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
+
+    return create_full_name(name, namespace);
+
+    break;
+
+  case 0x1:  // TypeRef index EMCA 335 II.22.38
+    data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
+    read_typeref_row(data, tables, index_sizes, &ref_row);
+
+    name = pe_get_dotnet_string(pe, str_heap, ref_row.TypeName);
+    namespace = pe_get_dotnet_string(pe, str_heap, ref_row.TypeNamespace);
+
+    return create_full_name(name, namespace);
+
+    break;
+
+  case 0x2:  // TypeSpec index ECMA 335 II.22.39
+    data = tables->typespec.Offset + tables->typespec.RowSize * index;
+    spec_row.Signature = read_index(&data, index_sizes->blob);
+    // Parsing Signature blob, skip for now
+    break;
+
+  default:
+    break;
+  }
+}
+
+static void dotnet_get_type_parents(
+    PE* pe,
+    TABLES* tables,
+    STREAMS* streams,
+    INDEX_SIZES* index_sizes,
+    uint32_t extends,
+    unsigned type_idx)
+{
+  INTERFACEIMPL_ROW row;
+  const uint8_t* data = NULL;
+  uint32_t base_type_idx = 0;
+
+  char* fullname = get_type_def_or_ref_fullname(
+      pe, tables, streams, index_sizes, extends);
+
+  if (fullname)
+    set_string(
+        fullname,
+        pe->object,
+        "classes[%i].base_types[%i]",
+        type_idx - 1,
+        base_type_idx++);
+
+  // linear search for every interface that the class implements
+  for (uint32_t i = 0; i < tables->intefaceimpl.RowCount; i++)
+  {
+    data = tables->intefaceimpl.Offset + tables->intefaceimpl.RowSize * i;
+    read_interfaceimpl_row(data, tables, index_sizes, &row);
+
+    if (row.Class == type_idx + 1)
+    {
+      fullname = get_type_def_or_ref_fullname(
+          pe, tables, streams, index_sizes, row.Interface);
+      set_string(
+          fullname,
+          pe->object,
+          "classes[%i].base_types[%i]",
+          type_idx - 1,
+          base_type_idx++);
+    }
+  }
+}
+
+void dotnet_parse_classes(
+    PE* pe,
+    TABLES* tables,
+    INDEX_SIZES* index_sizes,
+    STREAMS* streams)
+{
+  const uint8_t* str_heap = pe->data + streams->metadata_root +
+                            streams->string->Offset;
+  uint32_t row_count = 0;
+  uint32_t extends_size = 2;
+
+  row_count = max_rows(
+      3,
+      yr_le32toh(tables->typedef_.RowCount),
+      yr_le32toh(tables->typeref.RowCount),
+      yr_le32toh(tables->typespec.RowCount));
+
+  // coded index
+  if (row_count > (0xFFFF >> 0x02))
+    extends_size = 4;
+
+  // skip first class as it's pseudo class
+  for (unsigned type_idx = 1; type_idx < tables->typedef_.RowCount; type_idx++)
+  {
+    const uint8_t* data = tables->typedef_.Offset +
+                          tables->typedef_.RowSize * type_idx;
+
+    TYPEDEF_ROW row;
+    read_typedef_row(data, tables, index_sizes, &row);
+
+    char* class_name = pe_get_dotnet_string(pe, str_heap, row.Name);
+    char* class_namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
+
+    set_string(class_name, pe->object, "classes[%i].name", type_idx - 1);
+    set_string(class_namespace, pe->object, "classes[%i].namespace", type_idx - 1);
+
+    const char* visibility = get_visib_attr_str(row.Flags);
+    set_string(visibility, pe->object, "classes[%i].visibility", type_idx - 1);
+
+    const char* type = get_type_attr_str(row.Flags);
+    set_string(type, pe->object, "classes[%i].type", type_idx - 1);
+
+    set_integer(
+        (row.Flags & 0x80) != 0, pe->object, "classes[%i].abstract", type_idx - 1);
+    set_integer(
+        (row.Flags & 0x100) != 0, pe->object, "classes[%i].sealed", type_idx - 1);
+
+    dotnet_get_type_parents(
+        pe, tables, streams, index_sizes, row.Extends, type_idx);
+
+    // dotnet_get_class_methods();
+  }
 }
 
 void dotnet_parse_guid(
@@ -264,6 +564,8 @@ STREAMS dotnet_parse_stream_headers(
 
   memset(&headers, '\0', sizeof(STREAMS));
 
+  headers.metadata_root = metadata_root;
+
   stream_header = (PSTREAM_HEADER)(pe->data + offset);
 
   for (i = 0; i < num_streams; i++)
@@ -341,7 +643,6 @@ void dotnet_parse_tilde_2(
     PE* pe,
     PTILDE_HEADER tilde_header,
     int64_t resource_base,
-    int64_t metadata_root,
     ROWS rows,
     INDEX_SIZES index_sizes,
     PSTREAMS streams)
@@ -355,6 +656,8 @@ void dotnet_parse_tilde_2(
   PCUSTOMATTRIBUTE_TABLE customattribute_table;
   PCONSTANT_TABLE constant_table;
   DWORD resource_size, implementation;
+  // To save important data for future processing, initialize everything to 0
+  TABLES tables = {0};
 
   char* name;
   char typelib[MAX_TYPELIB_SIZE + 1];
@@ -362,6 +665,7 @@ void dotnet_parse_tilde_2(
   int bit_check;
   int matched_bits = 0;
 
+  int64_t metadata_root = streams->metadata_root;
   int64_t resource_offset, field_offset;
   uint32_t row_size, row_count, counter;
 
@@ -467,8 +771,13 @@ void dotnet_parse_tilde_2(
       if (name != NULL)
         set_string(name, pe->object, "module_name");
 
-      table_offset += (2 + index_sizes.string + (index_sizes.guid * 3)) *
-                      num_rows;
+      row_size = 2 + index_sizes.string + (index_sizes.guid * 3);
+
+      tables.module.Offset = table_offset;
+      tables.module.RowCount = num_rows;
+      tables.module.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_TYPEREF:
@@ -479,6 +788,7 @@ void dotnet_parse_tilde_2(
           yr_le32toh(rows.assemblyref),
           yr_le32toh(rows.typeref));
 
+      // coded ResolutionScope index
       if (row_count > (0xFFFF >> 0x02))
         index_size = 4;
       else
@@ -487,24 +797,35 @@ void dotnet_parse_tilde_2(
       row_size = (index_size + (index_sizes.string * 2));
       typeref_row_size = row_size;
       typeref_ptr = table_offset;
+
+      tables.typeref.Offset = table_offset;
+      tables.typeref.RowCount = num_rows;
+      tables.typeref.RowSize = row_size;
+
       table_offset += row_size * num_rows;
       break;
 
     case BIT_TYPEDEF:
+      // ECMA 335 II.22.37
       row_count = max_rows(
           3,
           yr_le32toh(rows.typedef_),
           yr_le32toh(rows.typeref),
           yr_le32toh(rows.typespec));
-
+      // extends coded index size
       if (row_count > (0xFFFF >> 0x02))
         index_size = 4;
       else
         index_size = 2;
 
-      table_offset += (4 + (index_sizes.string * 2) + index_size +
-                       index_sizes.field + index_sizes.methoddef) *
-                      num_rows;
+      row_size = 4 + (index_sizes.string * 2) + index_size +
+                 index_sizes.field + index_sizes.methoddef;
+
+      tables.typedef_.Offset = table_offset;
+      tables.typedef_.RowCount = num_rows;
+      tables.typedef_.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_FIELDPTR:
@@ -522,6 +843,13 @@ void dotnet_parse_tilde_2(
       break;
 
     case BIT_METHODDEF:
+      row_size = 4 + 2 + 2 + index_sizes.string + index_sizes.blob +
+                 index_sizes.param;
+
+      tables.methoddef.Offset = table_offset;
+      tables.methoddef.RowCount = num_rows;
+      tables.methoddef.RowSize = row_size;
+
       table_offset += (4 + 2 + 2 + index_sizes.string + index_sizes.blob +
                        index_sizes.param) *
                       num_rows;
@@ -543,7 +871,13 @@ void dotnet_parse_tilde_2(
       else
         index_size = 2;
 
-      table_offset += (index_sizes.typedef_ + index_size) * num_rows;
+      row_size = index_sizes.typedef_ + index_size;
+
+      tables.intefaceimpl.Offset = table_offset;
+      tables.intefaceimpl.RowCount = num_rows;
+      tables.intefaceimpl.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_MEMBERREF:
@@ -1042,11 +1376,23 @@ void dotnet_parse_tilde_2(
 
       set_integer(counter, pe->object, "number_of_modulerefs");
 
-      table_offset += (index_sizes.string) * num_rows;
+      row_size = index_sizes.string;
+
+      tables.moduleref.Offset = table_offset;
+      tables.moduleref.RowCount = num_rows;
+      tables.moduleref.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_TYPESPEC:
-      table_offset += (index_sizes.blob) * num_rows;
+      row_size = index_sizes.blob;
+
+      tables.typespec.Offset = table_offset;
+      tables.typespec.RowCount = num_rows;
+      tables.typespec.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_IMPLMAP:
@@ -1175,6 +1521,10 @@ void dotnet_parse_tilde_2(
       if (name != NULL && strlen(name) > 0)
         set_string(name, pe->object, "assembly.culture");
 
+      tables.assembly.Offset = table_offset;
+      tables.assembly.RowCount = num_rows;
+      tables.assembly.RowSize = row_size;
+
       table_offset += row_size * num_rows;
       break;
 
@@ -1273,6 +1623,10 @@ void dotnet_parse_tilde_2(
 
         row_ptr += row_size;
       }
+
+      tables.assemblyref.Offset = table_offset;
+      tables.assemblyref.RowCount = num_rows;
+      tables.assemblyref.RowSize = row_size;
 
       set_integer(i, pe->object, "number_of_assembly_refs");
       table_offset += row_size * num_rows;
@@ -1441,6 +1795,8 @@ void dotnet_parse_tilde_2(
 
     matched_bits++;
   }
+
+  dotnet_parse_classes(pe, &tables, &index_sizes, streams);
 }
 
 // Parsing the #~ stream is done in two parts. The first part (this function)
@@ -1450,14 +1806,13 @@ void dotnet_parse_tilde_2(
 
 void dotnet_parse_tilde(
     PE* pe,
-    int64_t metadata_root,
     PCLI_HEADER cli_header,
     PSTREAMS streams)
 {
   PTILDE_HEADER tilde_header;
   int64_t resource_base;
+  int64_t metadata_root = streams->metadata_root;
   uint32_t* row_offset = NULL;
-
   int bit_check;
 
   // This is used as an offset into the rows and tables. For every bit set in
@@ -1525,7 +1880,7 @@ void dotnet_parse_tilde(
     switch (bit_check)
     {
     case BIT_MODULE:
-      ROW_CHECK(module);
+      ROW_CHECK_WITH_INDEX(module);
       break;
     case BIT_MODULEREF:
       ROW_CHECK_WITH_INDEX(moduleref);
@@ -1537,7 +1892,7 @@ void dotnet_parse_tilde(
       ROW_CHECK_WITH_INDEX(assemblyrefprocessor);
       break;
     case BIT_TYPEREF:
-      ROW_CHECK(typeref);
+      ROW_CHECK_WITH_INDEX(typeref);
       break;
     case BIT_METHODDEF:
       ROW_CHECK_WITH_INDEX(methoddef);
@@ -1549,7 +1904,7 @@ void dotnet_parse_tilde(
       ROW_CHECK_WITH_INDEX(typedef_);
       break;
     case BIT_TYPESPEC:
-      ROW_CHECK(typespec);
+      ROW_CHECK_WITH_INDEX(typespec);
       break;
     case BIT_FIELD:
       ROW_CHECK_WITH_INDEX(field);
@@ -1561,7 +1916,7 @@ void dotnet_parse_tilde(
       ROW_CHECK_WITH_INDEX(property);
       break;
     case BIT_INTERFACEIMPL:
-      ROW_CHECK(interfaceimpl);
+      ROW_CHECK_WITH_INDEX(interfaceimpl);
       break;
     case BIT_EVENT:
       ROW_CHECK_WITH_INDEX(event);
@@ -1570,7 +1925,7 @@ void dotnet_parse_tilde(
       ROW_CHECK(standalonesig);
       break;
     case BIT_ASSEMBLY:
-      ROW_CHECK(assembly);
+      ROW_CHECK_WITH_INDEX(assembly);
       break;
     case BIT_FILE:
       ROW_CHECK(file);
@@ -1588,7 +1943,7 @@ void dotnet_parse_tilde(
       ROW_CHECK(genericparamconstraint);
       break;
     case BIT_METHODSPEC:
-      ROW_CHECK(methodspec);
+      ROW_CHECK_WITH_INDEX(methodspec);
       break;
     default:
       break;
@@ -1605,7 +1960,6 @@ void dotnet_parse_tilde(
       pe,
       tilde_header,
       resource_base,
-      metadata_root,
       rows,
       index_sizes,
       streams);
@@ -1683,7 +2037,9 @@ void dotnet_parse_com(PE* pe)
   // These tables reference the blob and string streams, so we need to ensure
   // those are not NULL also.
   if (headers.tilde != NULL && headers.string != NULL && headers.blob != NULL)
-    dotnet_parse_tilde(pe, metadata_root, cli_header, &headers);
+  {
+    dotnet_parse_tilde(pe, cli_header, &headers);
+  }
 
   if (headers.us != NULL)
     dotnet_parse_us(pe, metadata_root, headers.us);
@@ -1711,6 +2067,29 @@ begin_declarations
   end_struct_array("resources")
 
   declare_integer("number_of_resources");
+
+  begin_struct_array("classes")
+    declare_string("name");
+    declare_string("namespace");
+    declare_string("visibility");
+    declare_string("type");
+    declare_integer("abstract");
+    declare_integer("sealed");
+    declare_string_array("base_types");
+    begin_struct_array("methods")
+      declare_string("name");
+      declare_string("visiblity");
+      declare_integer("static");
+      declare_integer("virtual");
+      declare_integer("final");
+      declare_integer("abstract");
+      declare_string("return_type");
+      begin_struct_array("parameters")
+        declare_string("name")
+        declare_string("type")
+      end_struct_array("parameters")
+    end_struct_array("methods")
+  end_struct_array("classes")
 
   begin_struct_array("assembly_refs")
     begin_struct("version")
