@@ -239,6 +239,119 @@ void read_methoddef(
   result->ParamList = read_index(&data, index_sizes->param);
 }
 
+static char* create_type_from_signature(
+    PE* pe,
+    uint32_t sig_idx,
+    STREAMS* streams,
+    INDEX_SIZES* index_sizes)
+{
+  const uint8_t* data = pe->data + streams->metadata_root +
+                        streams->blob->Offset;
+  uint8_t type = *data;
+
+  switch (type)
+  {
+  case 0x1:
+    return "void";
+  case 0x2:
+    return "bool";
+  case 0x3:
+    return "char";
+  case 0x4:
+    return "int8";
+  case 0x5:
+    return "uint8";
+  case 0x6:
+    return "int16";
+  case 0x7:
+    return "uint16";
+  case 0x8:
+    return "int32";
+  case 0x9:
+    return "uint32";
+  case 0xa:
+    return "int64";
+  case 0xb:
+    return "uint64";
+  case 0xc:
+    return "float32";
+  case 0xd:
+    return "float64";
+  case 0xe:
+    return "string";
+  case 0xf:
+    // TODO PTR followed by type
+    return "ptr";
+  case 0x10:
+    // TODO BYREF followed by type
+    return "byref";
+  case 0x11:
+    // TODO ValueType followed by Def or Ref
+    return "value_type";
+  case 0x12:
+    // TODO Class followed by Def or Ref
+    return "class";
+  case 0x13:
+    // TODO generic param
+    return "var";
+  case 0x14:
+    // TODO array
+    return "array";
+  case 0x15:
+    // TODO
+    return "generic type instantiation";
+  case 0x16:
+    // TODO
+    return "typed by ref";
+  case 0x18:
+    return "System.IntPtr";
+  case 0x19:
+    return "System.UIntPtr";
+  case 0x1b:
+    // TODO
+    return "func ptr";
+  case 0x1c:
+    return "System.Object";
+  case 0x1d:
+    // TODO
+    return "Szarray";
+  case 0x1e:
+    // TODO
+    return "Mvar";
+  case 0x1f:
+    // TODO
+    return "Req modifier";
+  case 0x20:
+    // TODO
+    return "Opt modifier";
+  case 0x21:
+    // TODO
+    return "Internal";
+  case 0x40:
+    // TODO
+    return "Modifier";
+  case 0x41:
+    // TODO
+    return "Sentinel";
+  case 0x45:
+    // TODO
+    return "Pinned";
+  case 0x50:
+    // TODO
+    return "System.Type";
+  case 0x51:
+    // TODO
+    return "Boxed Object";
+  case 0x52:
+    return "Reserved";
+  case 0x53:
+    // TODO
+    return "Field";
+  default:
+    return NULL;
+  }
+}
+
 static char* get_type_def_or_ref_fullname(
     PE* pe,
     TABLES* tables,
@@ -246,25 +359,23 @@ static char* get_type_def_or_ref_fullname(
     INDEX_SIZES* index_sizes,
     uint32_t coded_index)
 {
-  TYPEDEF_ROW def_row;
-  TYPEREF_ROW ref_row;
-  TYPESPEC_ROW spec_row;
-
+  uint8_t table;
+  uint32_t index;
   char *name, *namespace;
-
   const uint8_t* data = NULL;
   const uint8_t* str_heap = pe->data + streams->metadata_root +
                             streams->string->Offset;
 
   // first 2 bits define table, index starts with third bit
-  uint32_t index = coded_index >> 2;
+  index = coded_index >> 2;
   // NULL index - interfaces or System.Object
   if (!index)
     return NULL;
 
-  switch (coded_index & 0x3)
-  {
-  case 0x0:  // TypeDef index EMCA 335 II.22.37
+  table = coded_index & 0x3;
+  if (table == 0)
+  {  // TypeDef index EMCA 335 II.22.37
+    TYPEDEF_ROW def_row;
     data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
     read_typedef(data, tables, index_sizes, &def_row);
 
@@ -272,10 +383,10 @@ static char* get_type_def_or_ref_fullname(
     namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
 
     return create_full_name(name, namespace);
-
-    break;
-
-  case 0x1:  // TypeRef index EMCA 335 II.22.38
+  }
+  else if (table == 1)
+  {  // TypeRef index EMCA 335 II.22.38
+    TYPEREF_ROW ref_row;
     data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
     read_typeref(data, tables, index_sizes, &ref_row);
 
@@ -283,17 +394,15 @@ static char* get_type_def_or_ref_fullname(
     namespace = pe_get_dotnet_string(pe, str_heap, ref_row.Namespace);
 
     return create_full_name(name, namespace);
-
-    break;
-
-  case 0x2:  // TypeSpec index ECMA 335 II.22.39
+  }
+  else if (table == 2)
+  {  // TypeSpec index ECMA 335 II.22.39
+    TYPESPEC_ROW spec_row;
     data = tables->typespec.Offset + tables->typespec.RowSize * index;
     spec_row.Signature = read_index(&data, index_sizes->blob);
-    // Parsing Signature blob, skip for now
-    break;
-
-  default:
-    break;
+    char* typename = create_type_from_signature(
+        pe, spec_row.Signature, streams, index_sizes);
+    return yr_strdup(typename);
   }
 
   return NULL;
@@ -363,7 +472,6 @@ void dotnet_parse_class_methods(
                             streams->string->Offset;
   const uint8_t* data = tables->methoddef.Offset +
                         tables->methoddef.RowSize * (methodlist - 1);
-
   METHODDEF_ROW row;
   read_methoddef(data, index_sizes, &row);
   char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
@@ -380,18 +488,6 @@ void dotnet_parse_user_types(
 {
   const uint8_t* str_heap = pe->data + streams->metadata_root +
                             streams->string->Offset;
-  uint32_t row_count = 0;
-  uint32_t extends_size = 2;
-
-  row_count = max_rows(
-      3,
-      yr_le32toh(tables->typedef_.RowCount),
-      yr_le32toh(tables->typeref.RowCount),
-      yr_le32toh(tables->typespec.RowCount));
-
-  // coded index
-  if (row_count > (0xFFFF >> 0x02))
-    extends_size = 4;
 
   // skip first class as it's pseudo class
   for (unsigned type_idx = 1; type_idx < tables->typedef_.RowCount; type_idx++)
@@ -402,11 +498,11 @@ void dotnet_parse_user_types(
     TYPEDEF_ROW row;
     read_typedef(data, tables, index_sizes, &row);
 
-    char* class_name = pe_get_dotnet_string(pe, str_heap, row.Name);
-    char* class_namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
+    char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+    char* namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
 
-    set_string(class_name, pe->object, "classes[%i].name", type_idx - 1);
-    set_string(class_namespace, pe->object, "classes[%i].namespace", type_idx - 1);
+    set_string(name, pe->object, "classes[%i].name", type_idx - 1);
+    set_string(namespace, pe->object, "classes[%i].namespace", type_idx - 1);
 
     const char* visibility = get_visib_attr_str(row.Flags);
     set_string(visibility, pe->object, "classes[%i].visibility", type_idx - 1);
