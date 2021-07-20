@@ -332,7 +332,7 @@ typedef struct _INTERFACEIMPL_ROW
   DWORD Interface;
 } INTERFACEIMPL_ROW, *PINTERFACEIMPL_ROW;
 
-typedef struct _METHODDEF_ROW // ECMA 335 II.22.26 
+typedef struct _METHODDEF_ROW  // ECMA 335 II.22.26
 {
   DWORD Rva;
   WORD ImplFlags;
@@ -341,6 +341,13 @@ typedef struct _METHODDEF_ROW // ECMA 335 II.22.26
   DWORD Signature;
   DWORD ParamList;
 } METHODDEF_ROW, *PMETHODDEF_ROW;
+
+typedef struct _PARAM_ROW  // ECMA 335 II.22.26
+{
+  WORD Flags;
+  WORD Sequence;
+  DWORD Name;
+} PARAM_ROW, *PPARAM_ROW;
 
 // Used to return offsets to the various headers.
 typedef struct _STREAMS
@@ -373,6 +380,7 @@ typedef struct _TABLES
   TABLE_INFO typespec;
   TABLE_INFO typeref;
   TABLE_INFO methoddef;
+  TABLE_INFO param;
   TABLE_INFO module;
   TABLE_INFO moduleref;
   TABLE_INFO assembly;

@@ -77,6 +77,80 @@ static uint32_t read_index(const uint8_t** data, unsigned len)
     return read_u32(data);
 }
 
+// Given an offset into a #US or #Blob stream, parse the entry at that position.
+// The offset is relative to the start of the PE file.
+BLOB_PARSE_RESULT dotnet_parse_blob_entry(PE* pe, const uint8_t* offset)
+{
+  BLOB_PARSE_RESULT result;
+
+  // Blob size is encoded in the first 1, 2 or 4 bytes of the blob.
+  //
+  // If the high bit is not set the length is encoded in one byte.
+  //
+  // If the high 2 bits are 10 (base 2) then the length is encoded in
+  // the rest of the bits and the next byte.
+  //
+  // If the high 3 bits are 110 (base 2) then the length is encoded
+  // in the rest of the bits and the next 3 bytes.
+  //
+  // See ECMA-335 II.24.2.4 for details.
+
+  // Make sure we have at least one byte.
+
+  if (!fits_in_pe(pe, offset, 1))
+  {
+    result.size = 0;
+    return result;
+  }
+
+  if ((*offset & 0x80) == 0x00)
+  {
+    result.length = (DWORD) *offset;
+    result.size = 1;
+  }
+  else if ((*offset & 0xC0) == 0x80)
+  {
+    // Make sure we have one more byte.
+    if (!fits_in_pe(pe, offset, 2))
+    {
+      result.size = 0;
+      return result;
+    }
+
+    // Shift remaining 6 bits left by 8 and OR in the remaining byte.
+    result.length = ((*offset & 0x3F) << 8) | *(offset + 1);
+    result.size = 2;
+  }
+  else if (offset + 4 < pe->data + pe->data_size && (*offset & 0xE0) == 0xC0)
+  {
+    // Make sure we have 3 more bytes.
+    if (!fits_in_pe(pe, offset, 4))
+    {
+      result.size = 0;
+      return result;
+    }
+
+    result.length = ((*offset & 0x1F) << 24) | (*(offset + 1) << 16) |
+                    (*(offset + 2) << 8) | *(offset + 3);
+    result.size = 4;
+  }
+  else
+  {
+    // Return a 0 size as an error.
+    result.size = 0;
+    return result;
+  }
+
+  // There is an additional terminal byte which is 0x01 under certain
+  // conditions. The exact conditions are not relevant to our parsing but are
+  // documented in ECMA-335 II.24.2.4.
+  // If think this applies only for #US
+  // if (result.length > 0)
+  //   result.length--;
+
+  return result;
+}
+
 char* pe_get_dotnet_string(
     PE* pe,
     const uint8_t* string_offset,
@@ -106,7 +180,7 @@ char* pe_get_dotnet_string(
 }
 
 // returns visibility string literal
-static const char* get_visib_attr_str(uint32_t flags)
+static const char* get_type_visibility(uint32_t flags)
 {
   // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
   switch (flags & 0x7)
@@ -126,7 +200,33 @@ static const char* get_visib_attr_str(uint32_t flags)
   case 0x7:
     return "private protected";
   default:
-    return NULL;
+    // assume anything else to be private?
+    return "private";
+  }
+}
+
+// returns visibility string literal
+static const char* get_method_visibility(uint32_t flags)
+{
+  // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
+  switch (flags & 0x7)
+  {
+  case 0x1:
+    return "private";
+  case 0x2:
+    return "private protected";
+  case 0x3:
+    return "internal";
+  case 0x4:
+    return "protected";
+  case 0x5:
+    return "protected public";
+  case 0x6:
+    return "public";
+  case 0x7:
+  default:
+    // assume anything else to be private?
+    return "private";
   }
 }
 
@@ -146,7 +246,7 @@ static char* create_full_name(const char* name, const char* namespace)
   return full_name;
 }
 
-static const char* get_type_attr_str(uint32_t flags)
+static const char* get_type(uint32_t flags)
 {
   // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
   switch (flags & 0x20)
@@ -239,6 +339,30 @@ void read_methoddef(
   result->ParamList = read_index(&data, index_sizes->param);
 }
 
+void read_param(
+    const uint8_t* data,
+    const INDEX_SIZES* index_sizes,
+    PARAM_ROW* result)
+{
+  result->Flags = read_u16(&data);
+  result->Sequence = read_u16(&data);
+  result->Name = read_index(&data, index_sizes->string);
+}
+
+static int get_param_count_from_signature(
+    PE* pe,
+    uint32_t sig_idx,
+    STREAMS* streams,
+    INDEX_SIZES* index_sizes)
+{
+  const uint8_t* data = pe->data + streams->metadata_root +
+                        streams->blob->Offset + sig_idx;
+  BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(pe, data);
+  data += blob_res.size;
+
+  return *(data + 1);
+}
+
 static char* create_type_from_signature(
     PE* pe,
     uint32_t sig_idx,
@@ -246,8 +370,12 @@ static char* create_type_from_signature(
     INDEX_SIZES* index_sizes)
 {
   const uint8_t* data = pe->data + streams->metadata_root +
-                        streams->blob->Offset;
-  uint8_t type = *data;
+                        streams->blob->Offset + sig_idx;
+  BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(pe, data);
+  data += blob_res.size;
+  // we don't use first byte currently
+  // [0] flags [1] param cnt [2] type [3] param1 [4] param2..param<param_count>
+  uint8_t type = *(data + 2);
 
   switch (type)
   {
@@ -352,529 +480,609 @@ static char* create_type_from_signature(
   }
 }
 
-static char* get_type_def_or_ref_fullname(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
-    uint32_t coded_index)
-{
-  uint8_t table;
-  uint32_t index;
-  char *name, *namespace;
-  const uint8_t* data = NULL;
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
-
-  // first 2 bits define table, index starts with third bit
-  index = coded_index >> 2;
-  // NULL index - interfaces or System.Object
-  if (!index)
-    return NULL;
-
-  table = coded_index & 0x3;
-  if (table == 0)
-  {  // TypeDef index EMCA 335 II.22.37
-    TYPEDEF_ROW def_row;
-    data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
-    read_typedef(data, tables, index_sizes, &def_row);
-
-    name = pe_get_dotnet_string(pe, str_heap, def_row.Name);
-    namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
-
-    return create_full_name(name, namespace);
-  }
-  else if (table == 1)
-  {  // TypeRef index EMCA 335 II.22.38
-    TYPEREF_ROW ref_row;
-    data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
-    read_typeref(data, tables, index_sizes, &ref_row);
-
-    name = pe_get_dotnet_string(pe, str_heap, ref_row.Name);
-    namespace = pe_get_dotnet_string(pe, str_heap, ref_row.Namespace);
-
-    return create_full_name(name, namespace);
-  }
-  else if (table == 2)
-  {  // TypeSpec index ECMA 335 II.22.39
-    TYPESPEC_ROW spec_row;
-    data = tables->typespec.Offset + tables->typespec.RowSize * index;
-    spec_row.Signature = read_index(&data, index_sizes->blob);
-    char* typename = create_type_from_signature(
-        pe, spec_row.Signature, streams, index_sizes);
-    return yr_strdup(typename);
-  }
-
-  return NULL;
-}
-
-static void dotnet_get_type_parents(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
-    uint32_t extends,
-    unsigned type_idx)
-{
-  INTERFACEIMPL_ROW row;
-  const uint8_t* data = NULL;
-  uint32_t base_type_idx = 0;
-
-  char* fullname = get_type_def_or_ref_fullname(
-      pe, tables, streams, index_sizes, extends);
-
-  if (fullname)
-    set_string(
-        fullname,
-        pe->object,
-        "classes[%i].base_types[%i]",
-        type_idx - 1,
-        base_type_idx++);
-  yr_free(fullname);
-
-  // linear search for every interface that the class implements
-  for (uint32_t i = 0; i < tables->intefaceimpl.RowCount; i++)
+  static char* get_type_def_or_ref_fullname(
+      PE * pe,
+      TABLES * tables,
+      STREAMS * streams,
+      INDEX_SIZES * index_sizes,
+      uint32_t coded_index)
   {
-    data = tables->intefaceimpl.Offset + tables->intefaceimpl.RowSize * i;
-    read_interfaceimpl(data, tables, index_sizes, &row);
+    uint8_t table;
+    uint32_t index;
+    char *name, *namespace;
+    const uint8_t* data = NULL;
+    const uint8_t* str_heap = pe->data + streams->metadata_root +
+                              streams->string->Offset;
 
-    // + 1 due tables using 1-based indexing
-    if (row.Class == type_idx + 1)
-    {
-      fullname = get_type_def_or_ref_fullname(
-          pe, tables, streams, index_sizes, row.Interface);
+    // first 2 bits define table, index starts with third bit
+    index = coded_index >> 2;
+    // NULL index - interfaces or System.Object
+    if (!index)
+      return NULL;
+
+    table = coded_index & 0x3;
+    if (table == 0)
+    {  // TypeDef index EMCA 335 II.22.37
+      TYPEDEF_ROW def_row;
+      data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
+      read_typedef(data, tables, index_sizes, &def_row);
+
+      name = pe_get_dotnet_string(pe, str_heap, def_row.Name);
+      namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
+
+      return create_full_name(name, namespace);
+    }
+    else if (table == 1)
+    {  // TypeRef index EMCA 335 II.22.38
+      TYPEREF_ROW ref_row;
+      data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
+      read_typeref(data, tables, index_sizes, &ref_row);
+
+      name = pe_get_dotnet_string(pe, str_heap, ref_row.Name);
+      namespace = pe_get_dotnet_string(pe, str_heap, ref_row.Namespace);
+
+      return create_full_name(name, namespace);
+    }
+    else if (table == 2)
+    {  // TypeSpec index ECMA 335 II.22.39
+      TYPESPEC_ROW spec_row;
+      data = tables->typespec.Offset + tables->typespec.RowSize * index;
+      spec_row.Signature = read_index(&data, index_sizes->blob);
+      char* typename = create_type_from_signature(
+          pe, spec_row.Signature, streams, index_sizes);
+      if (typename)
+        return yr_strdup(typename);
+    }
+
+    return NULL;
+  }
+
+  static void dotnet_get_type_parents(
+      PE * pe,
+      TABLES * tables,
+      STREAMS * streams,
+      INDEX_SIZES * index_sizes,
+      uint32_t extends,
+      unsigned type_idx)
+  {
+    INTERFACEIMPL_ROW row;
+    const uint8_t* data = NULL;
+    uint32_t base_type_idx = 0;
+
+    char* fullname = get_type_def_or_ref_fullname(
+        pe, tables, streams, index_sizes, extends);
+
+    if (fullname)
       set_string(
           fullname,
           pe->object,
           "classes[%i].base_types[%i]",
           type_idx - 1,
           base_type_idx++);
-      yr_free(fullname);
+    yr_free(fullname);
+
+    // linear search for every interface that the class implements
+    for (uint32_t i = 0; i < tables->intefaceimpl.RowCount; i++)
+    {
+      data = tables->intefaceimpl.Offset + tables->intefaceimpl.RowSize * i;
+      read_interfaceimpl(data, tables, index_sizes, &row);
+
+      // + 1 due tables using 1-based indexing
+      if (row.Class == type_idx + 1)
+      {
+        fullname = get_type_def_or_ref_fullname(
+            pe, tables, streams, index_sizes, row.Interface);
+        set_string(
+            fullname,
+            pe->object,
+            "classes[%i].base_types[%i]",
+            type_idx - 1,
+            base_type_idx++);
+        yr_free(fullname);
+      }
     }
   }
-}
 
-void dotnet_parse_class_methods(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
-    uint32_t methodlist,
-    unsigned type_idx)
-{
-  // Method list can be NULL
-  if (!methodlist) {
-    return;
-  }
-
-  // For now try the first method TODO
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
-  const uint8_t* data = tables->methoddef.Offset +
-                        tables->methoddef.RowSize * (methodlist - 1);
-  METHODDEF_ROW row;
-  read_methoddef(data, index_sizes, &row);
-  char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
-  if (name)
-    set_string(name, pe->object, "classes[%i].methods[0].name", type_idx - 1);
-}
-
-// Reads TypeDef table and reconstructs types with their methods
-void dotnet_parse_user_types(
-    PE* pe,
-    TABLES* tables,
-    INDEX_SIZES* index_sizes,
-    STREAMS* streams)
-{
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
-
-  // skip first class as it's pseudo class
-  for (unsigned type_idx = 1; type_idx < tables->typedef_.RowCount; type_idx++)
+  void dotnet_parse_method_params(
+      PE * pe,
+      TABLES * tables,
+      STREAMS * streams,
+      INDEX_SIZES * index_sizes,
+      uint32_t param_list,
+      const METHODDEF_ROW* next_type,  // used for getting the number of methods
+      unsigned method_idx,
+      unsigned type_idx,
+      int param_count,
+      uint32_t signature)
   {
-    const uint8_t* data = tables->typedef_.Offset +
-                          tables->typedef_.RowSize * type_idx;
-
-    TYPEDEF_ROW row;
-    read_typedef(data, tables, index_sizes, &row);
-
-    char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
-    char* namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
-
-    set_string(name, pe->object, "classes[%i].name", type_idx - 1);
-    set_string(namespace, pe->object, "classes[%i].namespace", type_idx - 1);
-
-    const char* visibility = get_visib_attr_str(row.Flags);
-    set_string(visibility, pe->object, "classes[%i].visibility", type_idx - 1);
-
-    const char* type = get_type_attr_str(row.Flags);
-    set_string(type, pe->object, "classes[%i].type", type_idx - 1);
-
-    set_integer(
-        (row.Flags & 0x80) != 0,
-        pe->object,
-        "classes[%i].abstract",
-        type_idx - 1);
-    set_integer(
-        (row.Flags & 0x100) != 0,
-        pe->object,
-        "classes[%i].sealed",
-        type_idx - 1);
-
-    dotnet_get_type_parents(
-        pe, tables, streams, index_sizes, row.Extends, type_idx);
-
-    dotnet_parse_class_methods(
-        pe, tables, streams, index_sizes, row.Method, type_idx);
-  }
-}
-
-void dotnet_parse_guid(
-    PE* pe,
-    int64_t metadata_root,
-    PSTREAM_HEADER guid_header)
-{
-  // GUIDs are 16 bytes each, converted to hex format plus separators and NULL.
-  char guid[37];
-  int i = 0;
-
-  const uint8_t* guid_offset = pe->data + metadata_root +
-                               yr_le32toh(guid_header->Offset);
-
-  DWORD guid_size = yr_le32toh(guid_header->Size);
-
-  // Limit the number of GUIDs to 16.
-  guid_size = yr_min(guid_size, 256);
-
-  // Parse GUIDs if we have them. GUIDs are 16 bytes each.
-  while (guid_size >= 16 && fits_in_pe(pe, guid_offset, 16))
-  {
-    sprintf(
-        guid,
-        "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        yr_le32toh(*(uint32_t*) guid_offset),
-        yr_le16toh(*(uint16_t*) (guid_offset + 4)),
-        yr_le16toh(*(uint16_t*) (guid_offset + 6)),
-        *(guid_offset + 8),
-        *(guid_offset + 9),
-        *(guid_offset + 10),
-        *(guid_offset + 11),
-        *(guid_offset + 12),
-        *(guid_offset + 13),
-        *(guid_offset + 14),
-        *(guid_offset + 15));
-
-    guid[(16 * 2) + 4] = '\0';
-
-    set_string(guid, pe->object, "guids[%i]", i);
-
-    i++;
-    guid_size -= 16;
-    guid_offset += 16;
-  }
-
-  set_integer(i, pe->object, "number_of_guids");
-}
-
-// Given an offset into a #US or #Blob stream, parse the entry at that position.
-// The offset is relative to the start of the PE file.
-BLOB_PARSE_RESULT dotnet_parse_blob_entry(PE* pe, const uint8_t* offset)
-{
-  BLOB_PARSE_RESULT result;
-
-  // Blob size is encoded in the first 1, 2 or 4 bytes of the blob.
-  //
-  // If the high bit is not set the length is encoded in one byte.
-  //
-  // If the high 2 bits are 10 (base 2) then the length is encoded in
-  // the rest of the bits and the next byte.
-  //
-  // If the high 3 bits are 110 (base 2) then the length is encoded
-  // in the rest of the bits and the next 3 bytes.
-  //
-  // See ECMA-335 II.24.2.4 for details.
-
-  // Make sure we have at least one byte.
-
-  if (!fits_in_pe(pe, offset, 1))
-  {
-    result.size = 0;
-    return result;
-  }
-
-  if ((*offset & 0x80) == 0x00)
-  {
-    result.length = (DWORD) *offset;
-    result.size = 1;
-  }
-  else if ((*offset & 0xC0) == 0x80)
-  {
-    // Make sure we have one more byte.
-    if (!fits_in_pe(pe, offset, 2))
+    if (!param_list)
     {
-      result.size = 0;
-      return result;
+      return;
     }
-
-    // Shift remaining 6 bits left by 8 and OR in the remaining byte.
-    result.length = ((*offset & 0x3F) << 8) | *(offset + 1);
-    result.size = 2;
-  }
-  else if (offset + 4 < pe->data + pe->data_size && (*offset & 0xE0) == 0xC0)
-  {
-    // Make sure we have 3 more bytes.
-    if (!fits_in_pe(pe, offset, 4))
+    const uint8_t* str_heap = pe->data + streams->metadata_root +
+                              streams->string->Offset;
+    for (int i = 0; i < param_count; i++)
     {
-      result.size = 0;
-      return result;
-    }
-
-    result.length = ((*offset & 0x1F) << 24) | (*(offset + 1) << 16) |
-                    (*(offset + 2) << 8) | *(offset + 3);
-    result.size = 4;
-  }
-  else
-  {
-    // Return a 0 size as an error.
-    result.size = 0;
-    return result;
-  }
-
-  // There is an additional terminal byte which is 0x01 under certain
-  // conditions. The exact conditions are not relevant to our parsing but are
-  // documented in ECMA-335 II.24.2.4.
-  if (result.length > 0)
-    result.length--;
-
-  return result;
-}
-
-void dotnet_parse_us(PE* pe, int64_t metadata_root, PSTREAM_HEADER us_header)
-{
-  BLOB_PARSE_RESULT blob_result;
-  int i = 0;
-
-  const uint32_t ush_sz = yr_le32toh(us_header->Size);
-
-  const uint8_t* offset = pe->data + metadata_root +
-                          yr_le32toh(us_header->Offset);
-  const uint8_t* end_of_header = offset + ush_sz;
-
-  // Make sure the header size is larger than 0 and its end is not past the
-  // end of PE.
-  if (ush_sz == 0 || !fits_in_pe(pe, offset, ush_sz))
-    return;
-
-  // The first entry MUST be single NULL byte.
-  if (*offset != 0x00)
-    return;
-
-  offset++;
-
-  while (offset < end_of_header)
-  {
-    blob_result = dotnet_parse_blob_entry(pe, offset);
-
-    if (blob_result.size == 0)
-      break;
-
-    offset += blob_result.size;
-    // Avoid empty strings, which usually happen as padding at the end of the
-    // stream.
-
-    if (blob_result.length > 0 && fits_in_pe(pe, offset, blob_result.length))
-    {
-      set_sized_string(
-          (char*) offset,
-          blob_result.length,
+      const uint8_t* data = tables->param.Offset +
+                            (param_list + i) * tables->param.RowSize;
+      PARAM_ROW row = {0};
+      read_param(data, index_sizes, &row);
+      const char* return_type = create_type_from_signature(
+          pe, signature + i, streams, index_sizes);
+      const char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+      set_string(
+          name,
           pe->object,
-          "user_strings[%i]",
+          "classes[%i].methods[%i].parameters[%i].name",
+          type_idx - 1,
+          method_idx,
           i);
-
-      offset += blob_result.length;
-      i++;
+      set_string(
+          return_type,
+          pe->object,
+          "classes[%i].methods[%i].parameters[%i].type",
+          type_idx - 1,
+          method_idx,
+          i);
     }
   }
 
-  set_integer(i, pe->object, "number_of_user_strings");
-}
-
-STREAMS dotnet_parse_stream_headers(
-    PE* pe,
-    int64_t offset,
-    int64_t metadata_root,
-    DWORD num_streams)
-{
-  PSTREAM_HEADER stream_header;
-  STREAMS headers;
-
-  char* start;
-  char* eos;
-  char stream_name[DOTNET_STREAM_NAME_SIZE + 1];
-  unsigned int i;
-
-  memset(&headers, '\0', sizeof(STREAMS));
-
-  headers.metadata_root = metadata_root;
-
-  stream_header = (PSTREAM_HEADER)(pe->data + offset);
-
-  for (i = 0; i < num_streams; i++)
+  void dotnet_parse_class_methods(
+      PE * pe,
+      TABLES * tables,
+      STREAMS * streams,
+      INDEX_SIZES * index_sizes,
+      uint32_t methodlist,
+      const TYPEDEF_ROW* next_type,  // used for getting the number of methods
+      unsigned type_idx)
   {
-    if (!struct_fits_in_pe(pe, stream_header, STREAM_HEADER))
-      break;
+    int method_count;
+    const uint8_t* str_heap = pe->data + streams->metadata_root +
+                              streams->string->Offset;
+    // Method list can be NULL
+    if (!methodlist)
+    {
+      return;
+    }
 
-    start = (char*) stream_header->Name;
+    if (!next_type)
+    {
+      method_count = tables->methoddef.RowCount - methodlist;
+    }
+    else if (next_type->Method >= methodlist)
+    {
+      method_count = next_type->Method - methodlist;
+    }
+    else
+    {
+      // shouldn't happen, how to approach this error state?
+      return;
+    }
+    for (int i = 0; i < method_count; i++)
+    {
+      // For now try the first method TODO
+      const uint8_t* data = tables->methoddef.Offset +
+                            tables->methoddef.RowSize * (methodlist - 1 + i);
+      METHODDEF_ROW row;
+      read_methoddef(data, index_sizes, &row);
+      char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
 
-    if (!fits_in_pe(pe, start, DOTNET_STREAM_NAME_SIZE))
-      break;
+      char* return_type = create_type_from_signature(
+          pe, row.Signature, streams, index_sizes);
+      int param_count = get_param_count_from_signature(
+          pe, row.Signature, streams, index_sizes);
 
-    eos = (char*) memmem((void*) start, DOTNET_STREAM_NAME_SIZE, "\0", 1);
+      const char* visibility = get_method_visibility(row.Flags);
+      bool stat = row.Flags & 0x10;
+      bool final = row.Flags & 0x20;
+      bool virtual = row.Flags & 0x40;
+      bool abstract = row.Flags & 0x400;
 
-    if (eos == NULL)
-      break;
-
-    strncpy(stream_name, stream_header->Name, DOTNET_STREAM_NAME_SIZE);
-    stream_name[DOTNET_STREAM_NAME_SIZE] = '\0';
-
-    set_string(stream_name, pe->object, "streams[%i].name", i);
-    // Offset is relative to metadata_root.
-    set_integer(
-        metadata_root + yr_le32toh(stream_header->Offset),
-        pe->object,
-        "streams[%i].offset",
-        i);
-    set_integer(
-        yr_le32toh(stream_header->Size), pe->object, "streams[%i].size", i);
-
-    // Store necessary bits to parse these later. Not all tables will be
-    // parsed, but are referenced from others. For example, the #Strings
-    // stream is referenced from various tables in the #~ heap.
-    //
-    // #- is not documented but it represents unoptimized metadata stream. It
-    // may contain additional tables such as FieldPtr, ParamPtr, MethodPtr or
-    // PropertyPtr for indirect referencing. We already take into account these
-    // tables and they do not interfere with anything we parse in this module.
-
-    if ((strncmp(stream_name, "#~", 2) == 0 ||
-         strncmp(stream_name, "#-", 2) == 0) &&
-        headers.tilde == NULL)
-      headers.tilde = stream_header;
-    else if (strncmp(stream_name, "#GUID", 5) == 0)
-      headers.guid = stream_header;
-    else if (strncmp(stream_name, "#Strings", 8) == 0 && headers.string == NULL)
-      headers.string = stream_header;
-    else if (strncmp(stream_name, "#Blob", 5) == 0)
-      headers.blob = stream_header;
-    else if (strncmp(stream_name, "#US", 3) == 0 && headers.us == NULL)
-      headers.us = stream_header;
-
-    // Stream name is padded to a multiple of 4.
-    stream_header = (PSTREAM_HEADER)(
-        (uint8_t*) stream_header + sizeof(STREAM_HEADER) + strlen(stream_name) +
-        4 - (strlen(stream_name) % 4));
+      set_string(
+          name, pe->object, "classes[%i].methods[%i].name", type_idx - 1, i);
+      set_string(
+          visibility,
+          pe->object,
+          "classes[%i].methods[%i].visibility",
+          type_idx - 1,
+          i);
+      set_string(
+          return_type,
+          pe->object,
+          "classes[%i].methods[%i].return_type",
+          type_idx - 1,
+          i);
+      set_integer(
+          stat, pe->object, "classes[%i].methods[%i].static", type_idx - 1, i);
+      set_integer(
+          final,
+          pe->object,
+          "classes[%i].methods[%i].virtual",
+          type_idx - 1,
+          i);
+      set_integer(
+          virtual,
+          pe->object,
+          "classes[%i].methods[%i].final",
+          type_idx - 1,
+          i);
+      set_integer(
+          abstract,
+          pe->object,
+          "classes[%i].methods[%i].abstract",
+          type_idx - 1,
+          i);
+      if (type_idx + 1 < tables->typedef_.RowCount)
+      {
+        METHODDEF_ROW next_row = {0};
+        data = tables->typedef_.Offset +
+               tables->typedef_.RowSize * (type_idx + 1);
+        read_methoddef(data, index_sizes, &next_row);
+        dotnet_parse_method_params(
+            pe,
+            tables,
+            streams,
+            index_sizes,
+            row.ParamList,
+            &next_row,
+            i,
+            type_idx,
+            param_count,
+            row.Signature + 1);
+      }
+      else
+      {
+        dotnet_parse_method_params(
+            pe,
+            tables,
+            streams,
+            index_sizes,
+            row.ParamList,
+            NULL,
+            i,
+            type_idx,
+            param_count,
+            row.Signature + 1);
+      }
+    }
   }
 
-  set_integer(i, pe->object, "number_of_streams");
+  // Reads TypeDef table and reconstructs types with their methods
+  void dotnet_parse_user_types(
+      PE * pe, TABLES * tables, INDEX_SIZES * index_sizes, STREAMS * streams)
+  {
+    const uint8_t* str_heap = pe->data + streams->metadata_root +
+                              streams->string->Offset;
 
-  return headers;
-}
+    // skip first class as it's pseudo class
+    for (unsigned type_idx = 1; type_idx < tables->typedef_.RowCount;
+         type_idx++)
+    {
+      const uint8_t* data = tables->typedef_.Offset +
+                            tables->typedef_.RowSize * type_idx;
 
-// This is the second pass through the data for #~. The first pass collects
-// information on the number of rows for tables which have coded indexes.
-// This pass uses that information and the index_sizes to parse the tables
-// of interest.
-//
-// Because the indexes can vary in size depending upon the number of rows in
-// other tables it is impossible to use static sized structures. To deal with
-// this hardcode the sizes of each table based upon the documentation (for the
-// static sized portions) and use the variable sizes accordingly.
+      TYPEDEF_ROW row;
+      read_typedef(data, tables, index_sizes, &row);
 
-void dotnet_parse_tilde_2(
-    PE* pe,
-    PTILDE_HEADER tilde_header,
-    int64_t resource_base,
-    ROWS rows,
-    INDEX_SIZES index_sizes,
-    PSTREAMS streams)
-{
-  PMODULE_TABLE module_table;
-  PASSEMBLY_TABLE assembly_table;
-  PASSEMBLYREF_TABLE assemblyref_table;
-  PFIELDRVA_TABLE fieldrva_table;
-  PMANIFESTRESOURCE_TABLE manifestresource_table;
-  PMODULEREF_TABLE moduleref_table;
-  PCUSTOMATTRIBUTE_TABLE customattribute_table;
-  PCONSTANT_TABLE constant_table;
-  DWORD resource_size, implementation;
-  // To save important data for future processing, initialize everything to 0
-  TABLES tables = {0};
+      char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+      char* namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
 
-  char* name;
-  char typelib[MAX_TYPELIB_SIZE + 1];
-  unsigned int i;
-  int bit_check;
-  int matched_bits = 0;
+      set_string(name, pe->object, "classes[%i].name", type_idx - 1);
+      set_string(namespace, pe->object, "classes[%i].namespace", type_idx - 1);
 
-  int64_t metadata_root = streams->metadata_root;
-  int64_t resource_offset, field_offset;
-  uint32_t row_size, row_count, counter;
+      const char* visibility = get_type_visibility(row.Flags);
+      set_string(
+          visibility, pe->object, "classes[%i].visibility", type_idx - 1);
 
-  const uint8_t* string_offset;
-  const uint8_t* blob_offset;
+      const char* type = get_type(row.Flags);
+      set_string(type, pe->object, "classes[%i].type", type_idx - 1);
 
-  uint32_t num_rows = 0;
-  uint32_t valid_rows = 0;
-  uint32_t* row_offset = NULL;
-  uint8_t* table_offset = NULL;
-  uint8_t* row_ptr = NULL;
+      set_integer(
+          (row.Flags & 0x80) != 0,
+          pe->object,
+          "classes[%i].abstract",
+          type_idx - 1);
+      set_integer(
+          (row.Flags & 0x100) != 0,
+          pe->object,
+          "classes[%i].sealed",
+          type_idx - 1);
 
-  // These are pointers and row sizes for tables of interest to us for special
-  // parsing. For example, we are interested in pulling out any CustomAttributes
-  // that are GUIDs so we need to be able to walk these tables. To find GUID
-  // CustomAttributes you need to walk the CustomAttribute table and look for
-  // any row with a Parent that indexes into the Assembly table and Type indexes
-  // into the MemberRef table. Then you follow the index into the MemberRef
-  // table and check the Class to make sure it indexes into TypeRef table. If it
-  // does you follow that index and make sure the Name is "GuidAttribute". If
-  // all that is valid then you can take the Value from the CustomAttribute
-  // table to find out the index into the Blob stream and parse that.
+      dotnet_get_type_parents(
+          pe, tables, streams, index_sizes, row.Extends, type_idx);
+
+      // there is N methods from Method index to start of Methods of the next
+      // typedef or to the last row of MethodDef table
+      // TODO optimize this (reading each row twice)
+
+      if (type_idx + 1 < tables->typedef_.RowCount)
+      {
+        TYPEDEF_ROW next_row = {0};
+        data = tables->typedef_.Offset +
+               tables->typedef_.RowSize * (type_idx + 1);
+        read_typedef(data, tables, index_sizes, &next_row);
+        dotnet_parse_class_methods(
+            pe, tables, streams, index_sizes, row.Method, &next_row, type_idx);
+      }
+      else
+      {
+        dotnet_parse_class_methods(
+            pe, tables, streams, index_sizes, row.Method, NULL, type_idx);
+      }
+    }
+  }
+
+  void dotnet_parse_guid(
+      PE * pe, int64_t metadata_root, PSTREAM_HEADER guid_header)
+  {
+    // GUIDs are 16 bytes each, converted to hex format plus separators and
+    // NULL.
+    char guid[37];
+    int i = 0;
+
+    const uint8_t* guid_offset = pe->data + metadata_root +
+                                 yr_le32toh(guid_header->Offset);
+
+    DWORD guid_size = yr_le32toh(guid_header->Size);
+
+    // Limit the number of GUIDs to 16.
+    guid_size = yr_min(guid_size, 256);
+
+    // Parse GUIDs if we have them. GUIDs are 16 bytes each.
+    while (guid_size >= 16 && fits_in_pe(pe, guid_offset, 16))
+    {
+      sprintf(
+          guid,
+          "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+          yr_le32toh(*(uint32_t*) guid_offset),
+          yr_le16toh(*(uint16_t*) (guid_offset + 4)),
+          yr_le16toh(*(uint16_t*) (guid_offset + 6)),
+          *(guid_offset + 8),
+          *(guid_offset + 9),
+          *(guid_offset + 10),
+          *(guid_offset + 11),
+          *(guid_offset + 12),
+          *(guid_offset + 13),
+          *(guid_offset + 14),
+          *(guid_offset + 15));
+
+      guid[(16 * 2) + 4] = '\0';
+
+      set_string(guid, pe->object, "guids[%i]", i);
+
+      i++;
+      guid_size -= 16;
+      guid_offset += 16;
+    }
+
+    set_integer(i, pe->object, "number_of_guids");
+  }
+
+  void dotnet_parse_us(PE * pe, int64_t metadata_root, PSTREAM_HEADER us_header)
+  {
+    BLOB_PARSE_RESULT blob_result;
+    int i = 0;
+
+    const uint32_t ush_sz = yr_le32toh(us_header->Size);
+
+    const uint8_t* offset = pe->data + metadata_root +
+                            yr_le32toh(us_header->Offset);
+    const uint8_t* end_of_header = offset + ush_sz;
+
+    // Make sure the header size is larger than 0 and its end is not past the
+    // end of PE.
+    if (ush_sz == 0 || !fits_in_pe(pe, offset, ush_sz))
+      return;
+
+    // The first entry MUST be single NULL byte.
+    if (*offset != 0x00)
+      return;
+
+    offset++;
+
+    while (offset < end_of_header)
+    {
+      blob_result = dotnet_parse_blob_entry(pe, offset);
+
+      if (blob_result.size == 0)
+        break;
+
+      offset += blob_result.size;
+      // Avoid empty strings, which usually happen as padding at the end of the
+      // stream.
+
+      if (blob_result.length > 0 && fits_in_pe(pe, offset, blob_result.length))
+      {
+        set_sized_string(
+            (char*) offset,
+            blob_result.length,
+            pe->object,
+            "user_strings[%i]",
+            i);
+
+        offset += blob_result.length;
+        i++;
+      }
+    }
+
+    set_integer(i, pe->object, "number_of_user_strings");
+  }
+
+  STREAMS dotnet_parse_stream_headers(
+      PE * pe, int64_t offset, int64_t metadata_root, DWORD num_streams)
+  {
+    PSTREAM_HEADER stream_header;
+    STREAMS headers;
+
+    char* start;
+    char* eos;
+    char stream_name[DOTNET_STREAM_NAME_SIZE + 1];
+    unsigned int i;
+
+    memset(&headers, '\0', sizeof(STREAMS));
+
+    headers.metadata_root = metadata_root;
+
+    stream_header = (PSTREAM_HEADER) (pe->data + offset);
+
+    for (i = 0; i < num_streams; i++)
+    {
+      if (!struct_fits_in_pe(pe, stream_header, STREAM_HEADER))
+        break;
+
+      start = (char*) stream_header->Name;
+
+      if (!fits_in_pe(pe, start, DOTNET_STREAM_NAME_SIZE))
+        break;
+
+      eos = (char*) memmem((void*) start, DOTNET_STREAM_NAME_SIZE, "\0", 1);
+
+      if (eos == NULL)
+        break;
+
+      strncpy(stream_name, stream_header->Name, DOTNET_STREAM_NAME_SIZE);
+      stream_name[DOTNET_STREAM_NAME_SIZE] = '\0';
+
+      set_string(stream_name, pe->object, "streams[%i].name", i);
+      // Offset is relative to metadata_root.
+      set_integer(
+          metadata_root + yr_le32toh(stream_header->Offset),
+          pe->object,
+          "streams[%i].offset",
+          i);
+      set_integer(
+          yr_le32toh(stream_header->Size), pe->object, "streams[%i].size", i);
+
+      // Store necessary bits to parse these later. Not all tables will be
+      // parsed, but are referenced from others. For example, the #Strings
+      // stream is referenced from various tables in the #~ heap.
+      //
+      // #- is not documented but it represents unoptimized metadata stream. It
+      // may contain additional tables such as FieldPtr, ParamPtr, MethodPtr or
+      // PropertyPtr for indirect referencing. We already take into account
+      // these tables and they do not interfere with anything we parse in this
+      // module.
+
+      if ((strncmp(stream_name, "#~", 2) == 0 ||
+           strncmp(stream_name, "#-", 2) == 0) &&
+          headers.tilde == NULL)
+        headers.tilde = stream_header;
+      else if (strncmp(stream_name, "#GUID", 5) == 0)
+        headers.guid = stream_header;
+      else if (
+          strncmp(stream_name, "#Strings", 8) == 0 && headers.string == NULL)
+        headers.string = stream_header;
+      else if (strncmp(stream_name, "#Blob", 5) == 0)
+        headers.blob = stream_header;
+      else if (strncmp(stream_name, "#US", 3) == 0 && headers.us == NULL)
+        headers.us = stream_header;
+
+      // Stream name is padded to a multiple of 4.
+      stream_header =
+          (PSTREAM_HEADER) ((uint8_t*) stream_header + sizeof(STREAM_HEADER) + strlen(stream_name) + 4 - (strlen(stream_name) % 4));
+    }
+
+    set_integer(i, pe->object, "number_of_streams");
+
+    return headers;
+  }
+
+  // This is the second pass through the data for #~. The first pass collects
+  // information on the number of rows for tables which have coded indexes.
+  // This pass uses that information and the index_sizes to parse the tables
+  // of interest.
   //
-  // Luckily we can abuse the fact that the order of the tables is guaranteed
-  // consistent (though some may not exist, but if they do exist they must exist
-  // in a certain order). The order is defined by their position in the Valid
-  // member of the tilde_header structure. By the time we are parsing the
-  // CustomAttribute table we have already recorded the location of the TypeRef
-  // and MemberRef tables, so we can follow the chain back up from
-  // CustomAttribute through MemberRef to TypeRef.
+  // Because the indexes can vary in size depending upon the number of rows in
+  // other tables it is impossible to use static sized structures. To deal with
+  // this hardcode the sizes of each table based upon the documentation (for the
+  // static sized portions) and use the variable sizes accordingly.
 
-  uint8_t* typeref_ptr = NULL;
-  uint8_t* memberref_ptr = NULL;
-  uint32_t typeref_row_size = 0;
-  uint32_t memberref_row_size = 0;
-  uint8_t* typeref_row = NULL;
-  uint8_t* memberref_row = NULL;
+  void dotnet_parse_tilde_2(
+      PE * pe,
+      PTILDE_HEADER tilde_header,
+      int64_t resource_base,
+      ROWS rows,
+      INDEX_SIZES index_sizes,
+      PSTREAMS streams)
+  {
+    PMODULE_TABLE module_table;
+    PASSEMBLY_TABLE assembly_table;
+    PASSEMBLYREF_TABLE assemblyref_table;
+    PFIELDRVA_TABLE fieldrva_table;
+    PMANIFESTRESOURCE_TABLE manifestresource_table;
+    PMODULEREF_TABLE moduleref_table;
+    PCUSTOMATTRIBUTE_TABLE customattribute_table;
+    PCONSTANT_TABLE constant_table;
+    DWORD resource_size, implementation;
+    // To save important data for future processing, initialize everything to 0
+    TABLES tables = {0};
 
-  DWORD type_index;
-  DWORD class_index;
-  BLOB_PARSE_RESULT blob_result;
-  DWORD blob_index;
-  DWORD blob_length;
+    char* name;
+    char typelib[MAX_TYPELIB_SIZE + 1];
+    unsigned int i;
+    int bit_check;
+    int matched_bits = 0;
 
-  // These are used to determine the size of coded indexes, which are the
-  // dynamically sized columns for some tables. The coded indexes are
-  // documented in ECMA-335 Section II.24.2.6.
-  uint8_t index_size, index_size2;
+    int64_t metadata_root = streams->metadata_root;
+    int64_t resource_offset, field_offset;
+    uint32_t row_size, row_count, counter;
 
-  // Number of rows is the number of bits set to 1 in Valid.
-  // Should use this technique:
-  // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetKernighan
-  for (i = 0; i < 64; i++)
-    valid_rows += ((yr_le64toh(tilde_header->Valid) >> i) & 0x01);
+    const uint8_t* string_offset;
+    const uint8_t* blob_offset;
 
-  row_offset = (uint32_t*) (tilde_header + 1);
-  table_offset = (uint8_t*) row_offset;
-  table_offset += sizeof(uint32_t) * valid_rows;
+    uint32_t num_rows = 0;
+    uint32_t valid_rows = 0;
+    uint32_t* row_offset = NULL;
+    uint8_t* table_offset = NULL;
+    uint8_t* row_ptr = NULL;
+
+    // These are pointers and row sizes for tables of interest to us for special
+    // parsing. For example, we are interested in pulling out any
+    // CustomAttributes that are GUIDs so we need to be able to walk these
+    // tables. To find GUID CustomAttributes you need to walk the
+    // CustomAttribute table and look for any row with a Parent that indexes
+    // into the Assembly table and Type indexes into the MemberRef table. Then
+    // you follow the index into the MemberRef table and check the Class to make
+    // sure it indexes into TypeRef table. If it does you follow that index and
+    // make sure the Name is "GuidAttribute". If all that is valid then you can
+    // take the Value from the CustomAttribute table to find out the index into
+    // the Blob stream and parse that.
+    //
+    // Luckily we can abuse the fact that the order of the tables is guaranteed
+    // consistent (though some may not exist, but if they do exist they must
+    // exist in a certain order). The order is defined by their position in the
+    // Valid member of the tilde_header structure. By the time we are parsing
+    // the CustomAttribute table we have already recorded the location of the
+    // TypeRef and MemberRef tables, so we can follow the chain back up from
+    // CustomAttribute through MemberRef to TypeRef.
+
+    uint8_t* typeref_ptr = NULL;
+    uint8_t* memberref_ptr = NULL;
+    uint32_t typeref_row_size = 0;
+    uint32_t memberref_row_size = 0;
+    uint8_t* typeref_row = NULL;
+    uint8_t* memberref_row = NULL;
+
+    DWORD type_index;
+    DWORD class_index;
+    BLOB_PARSE_RESULT blob_result;
+    DWORD blob_index;
+    DWORD blob_length;
+
+    // These are used to determine the size of coded indexes, which are the
+    // dynamically sized columns for some tables. The coded indexes are
+    // documented in ECMA-335 Section II.24.2.6.
+    uint8_t index_size, index_size2;
+
+    // Number of rows is the number of bits set to 1 in Valid.
+    // Should use this technique:
+    // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetKernighan
+    for (i = 0; i < 64; i++)
+      valid_rows += ((yr_le64toh(tilde_header->Valid) >> i) & 0x01);
+
+    row_offset = (uint32_t*) (tilde_header + 1);
+    table_offset = (uint8_t*) row_offset;
+    table_offset += sizeof(uint32_t) * valid_rows;
 
 #define DOTNET_STRING_INDEX(Name)                       \
   index_sizes.string == 2 ? yr_le16toh(Name.Name_Short) \
@@ -1007,7 +1215,13 @@ void dotnet_parse_tilde_2(
       break;
 
     case BIT_PARAM:
-      table_offset += (2 + 2 + index_sizes.string) * num_rows;
+      row_size = 2 + 2 + index_sizes.string;
+
+      tables.param.Offset = table_offset;
+      tables.param.RowCount = num_rows;
+      tables.param.RowSize = row_size;
+
+      table_offset += row_size * num_rows;
       break;
 
     case BIT_INTERFACEIMPL:
@@ -2228,17 +2442,17 @@ begin_declarations
     declare_integer("sealed");
     declare_string_array("base_types");
     begin_struct_array("methods")
-      declare_string("name");
-      declare_string("visiblity");
-      declare_integer("static");
-      declare_integer("virtual");
-      declare_integer("final");
-      declare_integer("abstract");
-      declare_string("return_type");
       begin_struct_array("parameters")
         declare_string("name")
         declare_string("type")
       end_struct_array("parameters")
+      declare_string("return_type");
+      declare_integer("abstract");
+      declare_integer("final");
+      declare_integer("virtual");
+      declare_integer("static");
+      declare_string("visibility");
+      declare_string("name");
     end_struct_array("methods")
   end_struct_array("classes")
 
