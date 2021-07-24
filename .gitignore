@@ -104,3 +104,5 @@ windows/*/packages/
 .dirstamp
 
 .idea/
+.vscode/
+compile_commands.json
