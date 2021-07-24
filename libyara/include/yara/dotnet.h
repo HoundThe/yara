@@ -1,6 +1,7 @@
 #ifndef YR_DOTNET_H
 #define YR_DOTNET_H
 
+#include <stdint.h>
 #include <yara/pe.h>
 
 #pragma pack(push, 1)
@@ -307,47 +308,79 @@ typedef struct _CONSTANT_TABLE
 
 typedef struct _TYPEDEF_ROW
 {
-  DWORD Flags;
-  DWORD Name;
-  DWORD Namespace;
-  DWORD Extends;
-  DWORD Field;
-  DWORD Method;
+  uint32_t Flags;
+  uint32_t Name;
+  uint32_t Namespace;
+  uint32_t Extends;
+  uint32_t Field;
+  uint32_t Method;
 } TYPEDEF_ROW, *PTYPEDEF_ROW;
 typedef struct _TYPESPEC_ROW
 {
-  DWORD Signature;
+  uint32_t Signature;
 } TYPESPEC_ROW, *PTYPESPEC_ROW;
 
 typedef struct _TYPEREF_ROW
 {
-  DWORD ResolutionScope;
-  DWORD Name;
-  DWORD Namespace;
+  uint32_t ResolutionScope;
+  uint32_t Name;
+  uint32_t Namespace;
 } TYPEREF_ROW, *PTYPEREF_ROW;
 
 typedef struct _INTERFACEIMPL_ROW
 {
-  DWORD Class;
-  DWORD Interface;
+  uint32_t Class;
+  uint32_t Interface;
 } INTERFACEIMPL_ROW, *PINTERFACEIMPL_ROW;
 
 typedef struct _METHODDEF_ROW  // ECMA 335 II.22.26
 {
-  DWORD Rva;
-  WORD ImplFlags;
-  WORD Flags;
-  DWORD Name;
-  DWORD Signature;
-  DWORD ParamList;
+  uint32_t Rva;
+  uint16_t ImplFlags;
+  uint16_t Flags;
+  uint32_t Name;
+  uint32_t Signature;
+  uint32_t ParamList;
 } METHODDEF_ROW, *PMETHODDEF_ROW;
 
 typedef struct _PARAM_ROW  // ECMA 335 II.22.26
 {
-  WORD Flags;
-  WORD Sequence;
-  DWORD Name;
+  uint16_t Flags;
+  uint16_t Sequence;
+  uint32_t Name;
 } PARAM_ROW, *PPARAM_ROW;
+
+typedef struct _GENERICPARAM_ROW  // ECMA 335 II.22.20 
+{
+  uint16_t Number;
+  uint16_t Flags;
+  uint32_t Owner;
+  uint32_t Name;
+} GENERICPARAM_ROW, *PGENERICPARAM_ROW;
+
+// typedef struct _DOTNET_CLASS
+// {
+//   uint32_t index;
+//   uint8_t table;
+//   char** gen_params;
+//   uint32_t gen_params_len;
+// } DOTNET_CLASS, *PDOTNET_CLASS;
+
+// typedef struct _DOTNET_METHOD
+// {
+//   uint32_t index;
+//   uint8_t table;
+//   uint32_t class_index;
+//   uint8_t class_table;
+//   char** gen_params;
+//   uint32_t gen_params_len;
+// } DOTNET_METHOD, *PDOTNET_METHOD;
+
+typedef struct _GENERIC_PARAMETERS
+{
+  char** names;
+  uint32_t len;
+} GENERIC_PARAMETERS, *PGENERIC_PARAMETERS;
 
 // Used to return offsets to the various headers.
 typedef struct _STREAMS
@@ -360,12 +393,19 @@ typedef struct _STREAMS
   PSTREAM_HEADER us;
 } STREAMS, *PSTREAMS;
 
+typedef struct _SIGNATURE_HEADER
+{
+  uint8_t flags;
+  uint8_t param_count;
+  uint8_t ret_type;
+} SIGNATURE_HEADER, *PSIGNATURE_HEADER;
+
 // Used to return the value of parsing a #US or #Blob entry.
 // ECMA-335 Section II.24.2.4
 typedef struct _BLOB_PARSE_RESULT
 {
-  uint8_t size;  // Number of bytes parsed. This is the new offset.
-  DWORD length;  // Value of the bytes parsed. This is the blob length.
+  uint8_t size;     // Number of bytes parsed. This is the new offset.
+  uint32_t length;  // Value of the bytes parsed. This is the blob length.
 } BLOB_PARSE_RESULT, *PBLOB_PARSE_RESULT;
 
 typedef struct _TABLE_INFO
@@ -386,6 +426,7 @@ typedef struct _TABLES
   TABLE_INFO assembly;
   TABLE_INFO assemblyref;
   TABLE_INFO intefaceimpl;
+  TABLE_INFO genericparam;
 } TABLES, *PTABLES;
 
 // Used to store the number of rows of each table.
