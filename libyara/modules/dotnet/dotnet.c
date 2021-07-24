@@ -26,8 +26,8 @@ limitations under the License.
 #include <yara/modules.h>
 #include <yara/pe.h>
 #include <yara/pe_utils.h>
-#include <yara/strutils.h>
 #include <yara/simple_str.h>
+#include <yara/strutils.h>
 #include "yara/endian.h"
 #include "yara/types.h"
 
@@ -56,7 +56,6 @@ static uint32_t max_rows(int count, ...)
   return biggest;
 }
 
-// endianess aware
 static uint32_t read_u32(const uint8_t** data)
 {
   uint32_t result = yr_le32toh(*(uint32_t*) *data);
@@ -64,7 +63,6 @@ static uint32_t read_u32(const uint8_t** data)
   return result;
 }
 
-// endianess aware
 static uint16_t read_u16(const uint8_t** data)
 {
   uint16_t result = yr_le16toh(*(uint16_t*) *data);
@@ -72,8 +70,7 @@ static uint16_t read_u16(const uint8_t** data)
   return result;
 }
 
-// endianess aware
-static uint32_t read_index(const uint8_t** data, unsigned len)
+static uint32_t read_index(const uint8_t** data, uint8_t len)
 {
   if (len == 2)
     return read_u16(data);
@@ -183,13 +180,12 @@ char* pe_get_dotnet_string(
   return start;
 }
 
-// returns visibility string literal
 static const char* get_type_visibility(uint32_t flags)
 {
   // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
   switch (flags & 0x7)
   {
-  case 0x0: // IL Spy treats 0x0 as internal
+  case 0x0:  // IL Spy treats 0x0 as internal
   case 0x3:
     return "private";
   case 0x1:
@@ -209,7 +205,6 @@ static const char* get_type_visibility(uint32_t flags)
   }
 }
 
-// returns visibility string literal
 static const char* get_method_visibility(uint32_t flags)
 {
   // ECMA 335 II.23.1.15 Flags for types [TypeAttribute]
@@ -276,68 +271,65 @@ static const char* get_type(uint32_t flags)
 }
 
 static void read_typedef(
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t* data,
-    const TABLES* tables,
-    const INDEX_SIZES* index_sizes,
     TYPEDEF_ROW* result)
 {
-  uint8_t extends_size = 2;
+  uint8_t ext_size = 2;
   uint32_t row_count = max_rows(
       3,
-      yr_le32toh(tables->typedef_.RowCount),
-      yr_le32toh(tables->typeref.RowCount),
-      yr_le32toh(tables->typespec.RowCount));
+      yr_le32toh(ctx->tables->typedef_.RowCount),
+      yr_le32toh(ctx->tables->typeref.RowCount),
+      yr_le32toh(ctx->tables->typespec.RowCount));
 
   if (row_count > (0xFFFF >> 0x02))
-    extends_size = 4;
+    ext_size = 4;
 
   result->Flags = read_u32(&data);
-  result->Name = read_index(&data, index_sizes->string);
-  result->Namespace = read_index(&data, index_sizes->string);
-  result->Extends = read_index(&data, extends_size);
-  result->Field = read_index(&data, index_sizes->field);
-  result->Method = read_index(&data, index_sizes->methoddef);
+  result->Name = read_index(&data, ctx->index_sizes->string);
+  result->Namespace = read_index(&data, ctx->index_sizes->string);
+  result->Extends = read_index(&data, ext_size);
+  result->Field = read_index(&data, ctx->index_sizes->field);
+  result->Method = read_index(&data, ctx->index_sizes->methoddef);
 }
 
 static void read_typeref(
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t* data,
-    const TABLES* tables,
-    const INDEX_SIZES* index_sizes,
     TYPEREF_ROW* result)
 {
-  uint8_t res_scope_size = 2;
+  uint8_t res_size = 2;
   uint32_t row_count = max_rows(
       4,
-      tables->module.RowCount,
-      tables->moduleref.RowCount,
-      tables->assemblyref.RowCount,
-      tables->typeref.RowCount);
+      ctx->tables->module.RowCount,
+      ctx->tables->moduleref.RowCount,
+      ctx->tables->assemblyref.RowCount,
+      ctx->tables->typeref.RowCount);
 
   if (row_count > (0xFFFF >> 0x02))
-    res_scope_size = 4;
+    res_size = 4;
 
-  result->ResolutionScope = read_index(&data, res_scope_size);
-  result->Name = read_index(&data, index_sizes->string);
-  result->Namespace = read_index(&data, index_sizes->string);
+  result->ResolutionScope = read_index(&data, res_size);
+  result->Name = read_index(&data, ctx->index_sizes->string);
+  result->Namespace = read_index(&data, ctx->index_sizes->string);
 }
 
 static void read_interfaceimpl(
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t* data,
-    const TABLES* tables,
-    const INDEX_SIZES* index_sizes,
     INTERFACEIMPL_ROW* result)
 {
   uint32_t interface_size = 2;
   uint32_t row_count = max_rows(
       3,
-      yr_le32toh(tables->typedef_.RowCount),
-      yr_le32toh(tables->typeref.RowCount),
-      yr_le32toh(tables->typespec.RowCount));
+      yr_le32toh(ctx->tables->typedef_.RowCount),
+      yr_le32toh(ctx->tables->typeref.RowCount),
+      yr_le32toh(ctx->tables->typespec.RowCount));
 
   if (row_count > (0xFFFF >> 0x02))
     interface_size = 4;
 
-  result->Class = read_index(&data, index_sizes->typedef_);
+  result->Class = read_index(&data, ctx->index_sizes->typedef_);
   result->Interface = read_index(&data, interface_size);
 }
 
@@ -365,16 +357,15 @@ static void read_param(
 }
 
 static void read_genericparam(
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t* data,
-    const TABLES* tables,
-    const INDEX_SIZES* index_sizes,
     GENERICPARAM_ROW* result)
 {
   uint32_t type_method_idx_size = 2;
   uint32_t row_count = max_rows(
       2,
-      yr_le32toh(tables->typedef_.RowCount),
-      yr_le32toh(tables->methoddef.RowCount));
+      yr_le32toh(ctx->tables->typedef_.RowCount),
+      yr_le32toh(ctx->tables->methoddef.RowCount));
 
   if (row_count > (0xFFFF >> 0x02))
     type_method_idx_size = 4;
@@ -382,7 +373,7 @@ static void read_genericparam(
   result->Number = read_u16(&data);
   result->Flags = read_u16(&data);
   result->Owner = read_index(&data, type_method_idx_size);
-  result->Name = read_index(&data, index_sizes->string);
+  result->Name = read_index(&data, ctx->index_sizes->string);
 }
 
 static uint32_t parse_compressed_unsigned(const uint8_t** data, uint32_t* len)
@@ -438,20 +429,14 @@ static uint32_t parse_compressed_unsigned(const uint8_t** data, uint32_t* len)
 }
 
 static char* parse_signature_type(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t** data,
     uint32_t* len,
     GENERIC_PARAMETERS* class_gen_params,
     GENERIC_PARAMETERS* method_gen_params);
 
 static char* get_type_def_or_ref_fullname(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     uint32_t coded_index,
     GENERIC_PARAMETERS* class_gen_params,
     GENERIC_PARAMETERS* method_gen_params)
@@ -460,8 +445,7 @@ static char* get_type_def_or_ref_fullname(
   uint32_t index;
   char *name, *namespace;
   const uint8_t* data = NULL;
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+  const uint8_t* str_heap = ctx->str_heap;
 
   // first 2 bits define table, index starts with third bit
   index = coded_index >> 2;
@@ -470,64 +454,54 @@ static char* get_type_def_or_ref_fullname(
     return NULL;
 
   table = coded_index & 0x3;
-  if (table == 0)
-  {  // TypeDef index EMCA 335 II.22.37
+  if (table == 0)  // TypeDef
+  {
     TYPEDEF_ROW def_row;
-    data = tables->typedef_.Offset + tables->typedef_.RowSize * (index - 1);
-    read_typedef(data, tables, index_sizes, &def_row);
+    data = ctx->tables->typedef_.Offset +
+           ctx->tables->typedef_.RowSize * (index - 1);
+    read_typedef(ctx, data, &def_row);
 
-    name = pe_get_dotnet_string(pe, str_heap, def_row.Name);
-    namespace = pe_get_dotnet_string(pe, str_heap, def_row.Namespace);
+    name = pe_get_dotnet_string(ctx->pe, str_heap, def_row.Name);
+    namespace = pe_get_dotnet_string(ctx->pe, str_heap, def_row.Namespace);
 
     return create_full_name(name, namespace);
   }
-  else if (table == 1)
-  {  // TypeRef index EMCA 335 II.22.38
+  else if (table == 1)  // TypeRef
+  {
     TYPEREF_ROW ref_row;
-    data = tables->typeref.Offset + tables->typeref.RowSize * (index - 1);
-    read_typeref(data, tables, index_sizes, &ref_row);
+    data = ctx->tables->typeref.Offset +
+           ctx->tables->typeref.RowSize * (index - 1);
+    read_typeref(ctx, data, &ref_row);
 
-    name = pe_get_dotnet_string(pe, str_heap, ref_row.Name);
-    namespace = pe_get_dotnet_string(pe, str_heap, ref_row.Namespace);
+    name = pe_get_dotnet_string(ctx->pe, str_heap, ref_row.Name);
+    namespace = pe_get_dotnet_string(ctx->pe, str_heap, ref_row.Namespace);
 
     return create_full_name(name, namespace);
   }
-  else if (table == 2)
-  {  // TypeSpec index ECMA 335 II.22.39
+  else if (table == 2)  // TypeSpec
+  {
     TYPESPEC_ROW spec_row;
-    data = tables->typespec.Offset + tables->typespec.RowSize * (index - 1);
-    spec_row.Signature = read_index(&data, index_sizes->blob);
+    data = ctx->tables->typespec.Offset +
+           ctx->tables->typespec.RowSize * (index - 1);
+    spec_row.Signature = read_index(&data, ctx->index_sizes->blob);
 
-    const uint8_t* sig_data = pe->data + streams->metadata_root +
-                              streams->blob->Offset + spec_row.Signature;
+    const uint8_t* sig_data = ctx->blob_heap + spec_row.Signature;
 
     // Read the blob entry with the data
-    BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(pe, sig_data);
+    BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(ctx->pe, sig_data);
     sig_data += blob_res.size;
     uint32_t sig_len = blob_res.length;
 
     // Valid blob and atleast minimum to parse (flags, paramCount, retType)
     if (blob_res.size)
-    {
       return parse_signature_type(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          &sig_data,
-          &sig_len,
-          class_gen_params,
-          NULL);
-    }
+          ctx, &sig_data, &sig_len, class_gen_params, NULL);
   }
   return NULL;
 }
 
 static char* parse_signature_type(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     const uint8_t** data,
     uint32_t* len,
     GENERIC_PARAMETERS* class_gen_params,
@@ -537,9 +511,7 @@ static char* parse_signature_type(
   uint32_t coded_index, index;
   char* tmp = NULL;
   char* ret_type = NULL;
-  const uint8_t* helper = NULL;
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+
   uint8_t type = *(*data)++;
   *len -= 1;
 
@@ -599,14 +571,7 @@ static char* parse_signature_type(
   case 0xf:
     // Ptr followed by type
     tmp = parse_signature_type(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        data,
-        len,
-        class_gen_params,
-        method_gen_params);
+        ctx, data, len, class_gen_params, method_gen_params);
     if (tmp)
     {
       SIMPLE_STR* str = sstr_new(NULL);
@@ -617,27 +582,17 @@ static char* parse_signature_type(
       }
       bool res = sstr_appendf(str, "Ptr<%s>", tmp);
       if (res)
-      {
         ret_type = yr_strdup(str->str);
-        sstr_free(str);
-        return ret_type;
-      }
 
       yr_free(tmp);
       sstr_free(str);
+      return ret_type;
     }
     break;
   case 0x10:
     // ByRef followed by type
     tmp = parse_signature_type(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        data,
-        len,
-        class_gen_params,
-        method_gen_params);
+        ctx, data, len, class_gen_params, method_gen_params);
     if (tmp)
     {
       SIMPLE_STR* str = sstr_new(NULL);
@@ -648,14 +603,11 @@ static char* parse_signature_type(
       }
       bool res = sstr_appendf(str, "ref %s", tmp);
       if (res)
-      {
         ret_type = yr_strdup(str->str);
-        sstr_free(str);
-        return ret_type;
-      }
 
       yr_free(tmp);
       sstr_free(str);
+      return ret_type;
     }
     break;
   case 0x11:  // ValueType
@@ -663,12 +615,7 @@ static char* parse_signature_type(
     // followed by TypeDefOrRefOrSpecEncoded
     coded_index = parse_compressed_unsigned(data, len);
     return get_type_def_or_ref_fullname(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        coded_index,
-        class_gen_params, method_gen_params);
+        ctx, coded_index, class_gen_params, method_gen_params);
     break;
   case 0x13:  // Generic class Var
     class = true;
@@ -688,18 +635,13 @@ static char* parse_signature_type(
     // ArrayShape = Rank -> NumSizes -> Size -> NumLobound -> LoBound
     // TODO find binary that uses this, test and heavy refactor
     {
-      char* type = parse_signature_type(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          data,
-          len,
-          class_gen_params,
-          method_gen_params);
+      char* tmp = parse_signature_type(
+          ctx, data, len, class_gen_params, method_gen_params);
+
       uint32_t *sizes = NULL, *lo_bounds = NULL;
       uint32_t num_sizes, num_lowbounds, rank;
-      if (!type)
+
+      if (!tmp)
         break;
       // ArrayShape logic
       rank = parse_compressed_unsigned(data, len);
@@ -708,11 +650,11 @@ static char* parse_signature_type(
 
       num_sizes = parse_compressed_unsigned(data, len);
       sizes = yr_malloc(sizeof(uint32_t) * num_sizes);
-      if (rank < num_sizes)
-        for (int i = 0; i < num_sizes; i++)
-        {
-          sizes[i] = parse_compressed_unsigned(data, len);
-        }
+
+      for (int i = 0; i < num_sizes; i++)
+      {
+        sizes[i] = parse_compressed_unsigned(data, len);
+      }
 
       num_lowbounds = parse_compressed_unsigned(data, len);
       lo_bounds = yr_malloc(sizeof(uint32_t) * num_lowbounds);
@@ -721,77 +663,51 @@ static char* parse_signature_type(
         lo_bounds[i] = parse_compressed_unsigned(data, len);
         // TODO Adjust higher bound according to lower bound
       }
-      uint32_t buf_len, helper_len = 0;
-      uint32_t max = num_sizes > num_lowbounds ? num_sizes : num_lowbounds;
 
-      char* str = NULL;
-      uint32_t str_len = 0;
-      uint32_t offset = 0;
+      SIMPLE_STR* str = sstr_new(NULL);
+      if (!str)
+        goto cleanup;
 
-      str_len = snprintf(NULL, 0, "%s[", type);
-      str = yr_malloc(str_len + 1);
-      snprintf(str, str_len + 1, "%s[", type);
-      offset = str_len;
+      sstr_appendf(str, "%s[", tmp);
 
-      // TODO heavy refactor
-      for (int i = 0; i < max; i++)
+      for (int i = 0; i < rank; i++)
       {
-        if (num_sizes < max || num_lowbounds < max)
+        if (num_sizes > i || num_lowbounds > i)
         {
-          if (num_lowbounds < max)
-          {
-            str_len += snprintf(NULL, 0, "%lu...", lo_bounds[i]);
-            str = yr_realloc(str, str_len + 1);
-            snprintf(str + offset, str_len + 1, "%lu...", lo_bounds[i]);
-            offset = str_len;
-          }
-          str_len += snprintf(NULL, 0, "%lu", sizes[i]);
-          str = yr_realloc(str, str_len + 1);
-          snprintf(str + offset, str_len + 1, "%lu", sizes[i]);
-          offset = str_len;
+          if (num_lowbounds > i)
+            sstr_appendf(str, "%lu...", lo_bounds[i]);
+          if (num_sizes > i)
+            sstr_appendf(str, "%lu", sizes[i]);
         }
-        else if (i + 1 != max)
-        {
-          str_len += 1;
-          str = yr_realloc(str, str_len + 1);
-          str[str_len - 1] = ',';
-          offset = str_len;
-        }
+        else if (i + 1 != rank)
+          sstr_appendf(str, ",");
       }
-      str_len += 1;
-      str = yr_realloc(str, str_len + 1);
-      str[str_len - 1] = ']';
-      offset = str_len;
+      bool res = sstr_appendf(str, "]");
+      if (res)
+        ret_type = yr_strdup(str->str);
+
       yr_free(sizes);
       yr_free(lo_bounds);
-      yr_free(type);
-      return str;
+      yr_free(tmp);
+      return ret_type;
 
     cleanup:
       yr_free(sizes);
       yr_free(lo_bounds);
-      yr_free(type);
+      yr_free(tmp);
     }
     break;
   case 0x15:
   {
-    char* inst_type = parse_signature_type(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        data,
-        len,
-        class_gen_params,
-        method_gen_params);
-    if (!inst_type)
-    {
+    tmp = parse_signature_type(
+        ctx, data, len, class_gen_params, method_gen_params);
+
+    if (!tmp)
       break;
-    }
 
     // Inst types have "`<gen param count>" at the end of the name
-    // for example List`1<string>, remove this from the string name
-    char* start = strchr(inst_type, '`');
+    // for example List`1, remove this from the string name
+    char* start = strchr(tmp, '`');
     if (start)
     {
       // Because this `<number> should be right at the end, we can
@@ -800,47 +716,33 @@ static char* parse_signature_type(
     }
     // TODO check if we can read this
     uint32_t gen_count = parse_compressed_unsigned(data, len);
-    // TODO create string abstraction or deal with alloc failures
-    size_t str_len = strlen(inst_type);
-    inst_type = yr_realloc(inst_type, str_len + 1 + 1);
-    inst_type[str_len] = '<';
-    inst_type[str_len + 1] = 0;
-    str_len += 1;
-    uint32_t offset = str_len;
+
+    SIMPLE_STR* str = sstr_new(NULL);
+    if (!str)
+    {
+      yr_free(tmp);
+      break;
+    }
+    sstr_appendf(str, "%s<", tmp);
+    yr_free(tmp);
 
     for (int i = 0; i < gen_count; i++)
     {
       char* param_type = parse_signature_type(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          data,
-          len,
-          class_gen_params,
-          method_gen_params);
+          ctx, data, len, class_gen_params, method_gen_params);
       if (i)
-      {
-        str_len = snprintf(NULL, 0, "%s%s", inst_type, ",");
-        inst_type = yr_realloc(inst_type, str_len + 1);
-        snprintf(inst_type + offset, str_len + 1, "%s", ",");
-        offset = str_len;
-      }
+        sstr_appendf(str, ",");
       if (param_type)
-      {
-        str_len = snprintf(NULL, 0, "%s%s", inst_type, param_type);
-        inst_type = yr_realloc(inst_type, str_len + 1);
-        snprintf(inst_type + offset, str_len + 1, "%s", param_type);
-        offset = str_len;
-      }
+        sstr_appendf(str, "%s", param_type);
+
+      yr_free(param_type);
     }
+    bool res = sstr_appendf(str, ">");
+    if (res)
+      ret_type = yr_strdup(str->str);
 
-    str_len = snprintf(NULL, 0, "%s%s", inst_type, ">");
-    inst_type = yr_realloc(inst_type, str_len + 1);
-    snprintf(inst_type + offset, str_len + 1, "%s", ">");
-    offset = str_len;
-
-    return inst_type;
+    sstr_free(str);
+    return ret_type;
   }
   break;
   case 0x1b:
@@ -851,55 +753,38 @@ static char* parse_signature_type(
     (*len)--;
     {
       uint32_t param_count = parse_compressed_unsigned(data, len);
-      char* fn_ret_type = parse_signature_type(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          data,
-          len,
-          class_gen_params,
-          method_gen_params);
+      tmp = parse_signature_type(
+          ctx, data, len, class_gen_params, method_gen_params);
 
-      size_t str_len = snprintf(NULL, 0, "%s%s", "FnPtr<", fn_ret_type);
-      ret_type = yr_realloc(ret_type, str_len + 1 + 1);
-      snprintf(ret_type, str_len + 1, "%s%s", "FnPtr<", fn_ret_type);
-      ret_type[str_len] = '(';
-      ret_type[str_len + 1] = 0;
-      str_len += 1;
-      uint32_t offset = str_len;
+      if (!tmp)
+        break;
+
+      SIMPLE_STR* str = sstr_new(NULL);
+      if (!str)
+      {
+        yr_free(tmp);
+        break;
+      }
+
+      sstr_appendf(str, "FnPtr<%s(", tmp);
+      yr_free(tmp);
+
       for (int i = 0; i < param_count; i++)
       {
         char* param_type = parse_signature_type(
-            pe,
-            tables,
-            streams,
-            index_sizes,
-            data,
-            len,
-            class_gen_params,
-            method_gen_params);
+            ctx, data, len, class_gen_params, method_gen_params);
         if (i)
-        {
-          str_len = snprintf(NULL, 0, "%s%s", ret_type, ",");
-          ret_type = yr_realloc(ret_type, str_len + 1);
-          snprintf(ret_type + offset, str_len + 1, "%s", ",");
-          offset = str_len;
-        }
+          sstr_appendf(str, ",");
         if (param_type)
-        {
-          str_len = snprintf(NULL, 0, "%s%s", ret_type, param_type);
-          ret_type = yr_realloc(ret_type, str_len + 1);
-          snprintf(ret_type + offset, str_len + 1, "%s", param_type);
-          offset = str_len;
-        }
+          sstr_appendf(str, "%s", param_type);
+
+        yr_free(param_type);
       }
+      bool res = sstr_appendf(str, ")>");
+      if (res)
+        ret_type = yr_strdup(str->str);
 
-      str_len = snprintf(NULL, 0, "%s%s", ret_type, ")>");
-      ret_type = yr_realloc(ret_type, str_len + 1);
-      snprintf(ret_type + offset, str_len + 1, "%s", ")>");
-      offset = str_len;
-
+      sstr_free(str);
       return ret_type;
     }
     break;
@@ -909,24 +794,22 @@ static char* parse_signature_type(
   case 0x1d:
     // Single dimensional array followed by type
     tmp = parse_signature_type(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        data,
-        len,
-        class_gen_params,
-        method_gen_params);
+        ctx, data, len, class_gen_params, method_gen_params);
     if (tmp)
     {
-      uint32_t type_len = strlen(tmp);
-      // Result has format "type[]"
-      ret_type = yr_malloc(type_len + 2 + 1);
-      memcpy(ret_type, tmp, type_len);
-      memcpy(ret_type + type_len, "[]", 2);
-      ret_type[type_len + 2] = 0;
+      SIMPLE_STR* str = sstr_new(NULL);
+      if (!str)
+      {
+        yr_free(tmp);
+        break;
+      }
+
+      bool res = sstr_appendf(str, "%s[]", tmp);
+      if (res)
+        ret_type = yr_strdup(str->str);
 
       yr_free(tmp);
+      sstr_free(str);
       return ret_type;
     }
     break;
@@ -935,16 +818,9 @@ static char* parse_signature_type(
   {
     // TODO Research the point of these
     // Right now ignore them...
-    uint32_t type_idx = parse_compressed_unsigned(data, len);
+    parse_compressed_unsigned(data, len);
     return parse_signature_type(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        data,
-        len,
-        class_gen_params,
-        method_gen_params);
+        ctx, data, len, class_gen_params, method_gen_params);
   }
   break;
   default:
@@ -957,10 +833,7 @@ static char* parse_signature_type(
 }
 
 static void dotnet_get_type_parents(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     uint32_t extends,
     unsigned type_idx,
     GENERIC_PARAMETERS* class_gen_params)
@@ -970,12 +843,12 @@ static void dotnet_get_type_parents(
   uint32_t base_type_idx = 0;
 
   char* fullname = get_type_def_or_ref_fullname(
-      pe, tables, streams, index_sizes, extends, class_gen_params, NULL);
+      ctx, extends, class_gen_params, NULL);
 
   if (fullname)
     set_string(
         fullname,
-        pe->object,
+        ctx->pe->object,
         "classes[%i].base_types[%i]",
         type_idx - 1,
         base_type_idx++);
@@ -983,25 +856,20 @@ static void dotnet_get_type_parents(
   yr_free(fullname);
 
   // linear search for every interface that the class implements
-  for (uint32_t i = 0; i < tables->intefaceimpl.RowCount; i++)
+  for (uint32_t i = 0; i < ctx->tables->intefaceimpl.RowCount; i++)
   {
-    data = tables->intefaceimpl.Offset + tables->intefaceimpl.RowSize * i;
-    read_interfaceimpl(data, tables, index_sizes, &row);
+    data = ctx->tables->intefaceimpl.Offset +
+           ctx->tables->intefaceimpl.RowSize * i;
+    read_interfaceimpl(ctx, data, &row);
 
     // + 1 due tables using 1-based indexing
     if (row.Class == type_idx + 1)
     {
       fullname = get_type_def_or_ref_fullname(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          row.Interface,
-          class_gen_params,
-          NULL);
+          ctx, row.Interface, class_gen_params, NULL);
       set_string(
           fullname,
-          pe->object,
+          ctx->pe->object,
           "classes[%i].base_types[%i]",
           type_idx - 1,
           base_type_idx++);
@@ -1011,43 +879,42 @@ static void dotnet_get_type_parents(
 }
 
 void dotnet_parse_method_params(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     uint32_t param_list,
     uint32_t method_idx,
     uint32_t class_idx,
     uint32_t param_count,
     const uint8_t* sig_data,
     uint32_t sig_len,
-    GENERIC_PARAMETERS *class_gen_params,
-    GENERIC_PARAMETERS *method_gen_params)
+    GENERIC_PARAMETERS* class_gen_params,
+    GENERIC_PARAMETERS* method_gen_params)
 {
   if (!param_list)
     return;
 
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+  const uint8_t* str_heap = ctx->str_heap;
+
   for (int i = 0; i < param_count; i++)
   {
-    const uint8_t* data = tables->param.Offset +
-                          (param_list - 1 + i) * tables->param.RowSize;
+    const uint8_t* data = ctx->tables->param.Offset +
+                          (param_list - 1 + i) * ctx->tables->param.RowSize;
     PARAM_ROW row = {0};
-    read_param(data, index_sizes, &row);
+    read_param(data, ctx->index_sizes, &row);
     char* return_type = parse_signature_type(
-        pe, tables, streams, index_sizes, &sig_data, &sig_len, class_gen_params, method_gen_params);
-    const char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+        ctx, &sig_data, &sig_len, class_gen_params, method_gen_params);
+    const char* name = pe_get_dotnet_string(ctx->pe, str_heap, row.Name);
+
+    YR_OBJECT* out_obj = ctx->pe->object;
     set_string(
         name,
-        pe->object,
+        out_obj,
         "classes[%i].methods[%i].parameters[%i].name",
         class_idx,
         method_idx,
         i);
     set_string(
         return_type,
-        pe->object,
+        out_obj,
         "classes[%i].methods[%i].parameters[%i].type",
         class_idx,
         method_idx,
@@ -1058,27 +925,23 @@ void dotnet_parse_method_params(
 }
 
 bool dotnet_parse_generic_params(
-    PE* pe,
-    TABLES* tables,
-    INDEX_SIZES* index_sizes,
-    STREAMS* streams,
+    CLASS_PARSING_CONTEXT* ctx,
     bool method,  // true means MethodDef, false TypeDef index
     uint32_t index,
     GENERIC_PARAMETERS* result)
 {
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+  const uint8_t* str_heap = ctx->str_heap;
   // Traverse the GenericParam table to find GenParameters of the class/method
   GENERICPARAM_ROW row;
 
   result->names = NULL;
   result->len = 0;
 
-  for (int idx = 0; idx < tables->genericparam.RowCount; idx++)
+  for (int idx = 0; idx < ctx->tables->genericparam.RowCount; idx++)
   {
-    const uint8_t* data = tables->genericparam.Offset +
-                          tables->genericparam.RowSize * idx;
-    read_genericparam(data, tables, index_sizes, &row);
+    const uint8_t* data = ctx->tables->genericparam.Offset +
+                          ctx->tables->genericparam.RowSize * idx;
+    read_genericparam(ctx, data, &row);
 
     // TypeOrMethodDef coded index
     uint8_t table = row.Owner & 0x1;
@@ -1086,7 +949,7 @@ bool dotnet_parse_generic_params(
     // Check if it's generic param of the type we want
     if (table == method && (row.Owner >> 1) == index)
     {
-      char* name = pe_get_dotnet_string(pe, str_heap, row.Name);
+      char* name = pe_get_dotnet_string(ctx->pe, str_heap, row.Name);
       // name must be valid string by specification
       if (!name)
       {  // ERROR
@@ -1113,18 +976,14 @@ bool dotnet_parse_generic_params(
 }
 
 void dotnet_parse_class_methods(
-    PE* pe,
-    TABLES* tables,
-    STREAMS* streams,
-    INDEX_SIZES* index_sizes,
+    CLASS_PARSING_CONTEXT* ctx,
     uint32_t methodlist,
     uint32_t method_count,
     uint32_t class_idx,
     GENERIC_PARAMETERS* class_gen_params)
 {
   uint32_t idx, i;
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+  const uint8_t* str_heap = ctx->str_heap;
   // Method list can be NULL
   if (!methodlist)
     return;
@@ -1141,29 +1000,28 @@ void dotnet_parse_class_methods(
     GENERIC_PARAMETERS method_gen_params = {0};
 
     // For now try the first method TODO
-    data = tables->methoddef.Offset +
-           tables->methoddef.RowSize * (methodlist - 1 + idx);
-    read_methoddef(data, index_sizes, &row);
-    name = pe_get_dotnet_string(pe, str_heap, row.Name);
+    data = ctx->tables->methoddef.Offset +
+           ctx->tables->methoddef.RowSize * (methodlist - 1 + idx);
+    read_methoddef(data, ctx->index_sizes, &row);
+    name = pe_get_dotnet_string(ctx->pe, str_heap, row.Name);
 
     dotnet_parse_generic_params(
-        pe, tables, index_sizes, streams, true, methodlist + idx, &method_gen_params);
+        ctx, true, methodlist + idx, &method_gen_params);
 
     for (i = 0; i < method_gen_params.len; ++i)
     {
       set_string(
           method_gen_params.names[i],
-          pe->object,
+          ctx->pe->object,
           "classes[%i].methods[%i].generic_parameters[%i]",
           class_idx,
           idx,
           i);
     }
 
-    sig_data = pe->data + streams->metadata_root + streams->blob->Offset +
-               row.Signature;
+    sig_data = ctx->blob_heap + row.Signature;
     // Read the blob entry with the data
-    BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(pe, sig_data);
+    BLOB_PARSE_RESULT blob_res = dotnet_parse_blob_entry(ctx->pe, sig_data);
     sig_data += blob_res.size;
     sig_len = blob_res.length;
 
@@ -1176,18 +1034,12 @@ void dotnet_parse_class_methods(
       sig_len -= 1;
       // Is generic
       if (flags & 0x10)
+        // not used
         gen_param_count = parse_compressed_unsigned(&sig_data, &sig_len);
 
       param_count = parse_compressed_unsigned(&sig_data, &sig_len);
       return_type = parse_signature_type(
-          pe,
-          tables,
-          streams,
-          index_sizes,
-          &sig_data,
-          &sig_len,
-          class_gen_params,
-          &method_gen_params);
+          ctx, &sig_data, &sig_len, class_gen_params, &method_gen_params);
     }
 
     visibility = get_method_visibility(row.Flags);
@@ -1197,40 +1049,33 @@ void dotnet_parse_class_methods(
     virtual = (row.Flags & 0x40) != 0;
     abstract = (row.Flags & 0x400) != 0;
 
-    set_string(
-        name, pe->object, "classes[%i].methods[%i].name", class_idx, idx);
+    YR_OBJECT* out_obj = ctx->pe->object;
+    set_string(name, out_obj, "classes[%i].methods[%i].name", class_idx, idx);
     set_string(
         visibility,
-        pe->object,
+        out_obj,
         "classes[%i].methods[%i].visibility",
         class_idx,
         idx);
     set_string(
         return_type,
-        pe->object,
+        out_obj,
         "classes[%i].methods[%i].return_type",
         class_idx,
         idx);
     set_integer(
-        stat, pe->object, "classes[%i].methods[%i].static", class_idx, idx);
+        stat, out_obj, "classes[%i].methods[%i].static", class_idx, idx);
     set_integer(
-        final, pe->object, "classes[%i].methods[%i].virtual", class_idx, idx);
+        final, out_obj, "classes[%i].methods[%i].virtual", class_idx, idx);
     set_integer(
-        virtual, pe->object, "classes[%i].methods[%i].final", class_idx, idx);
+        virtual, out_obj, "classes[%i].methods[%i].final", class_idx, idx);
     set_integer(
-        abstract,
-        pe->object,
-        "classes[%i].methods[%i].abstract",
-        class_idx,
-        idx);
+        abstract, out_obj, "classes[%i].methods[%i].abstract", class_idx, idx);
 
     yr_free(return_type);
 
     dotnet_parse_method_params(
-        pe,
-        tables,
-        streams,
-        index_sizes,
+        ctx,
         row.ParamList,
         idx,
         class_idx,
@@ -1245,31 +1090,26 @@ void dotnet_parse_class_methods(
 }
 
 // Reads TypeDef table and reconstructs types with their methods
-void dotnet_parse_user_types(
-    PE* pe,
-    TABLES* tables,
-    INDEX_SIZES* index_sizes,
-    STREAMS* streams)
+void dotnet_parse_user_types(CLASS_PARSING_CONTEXT* ctx)
 {
   uint32_t type_idx, i;
-  const uint8_t* str_heap = pe->data + streams->metadata_root +
-                            streams->string->Offset;
+  const uint8_t* str_heap = ctx->str_heap;
 
   // skip first class as it's module pseudo class
-  for (type_idx = 1; type_idx < tables->typedef_.RowCount; ++type_idx)
+  for (type_idx = 1; type_idx < ctx->tables->typedef_.RowCount; ++type_idx)
   {
     const char *name, *namespace, *visibility, *type;
-    uint32_t abstract, sealed, class_idx, method_count;
+    uint32_t abstract, sealed, method_count;
     TYPEDEF_ROW row;
     GENERIC_PARAMETERS class_gen_params = {0};
 
-    const uint8_t* data = tables->typedef_.Offset +
-                          tables->typedef_.RowSize * type_idx;
+    const uint8_t* data = ctx->tables->typedef_.Offset +
+                          ctx->tables->typedef_.RowSize * type_idx;
 
-    read_typedef(data, tables, index_sizes, &row);
+    read_typedef(ctx, data, &row);
 
-    name = pe_get_dotnet_string(pe, str_heap, row.Name);
-    namespace = pe_get_dotnet_string(pe, str_heap, row.Namespace);
+    name = pe_get_dotnet_string(ctx->pe, str_heap, row.Name);
+    namespace = pe_get_dotnet_string(ctx->pe, str_heap, row.Namespace);
 
     type = get_type(row.Flags);
     visibility = get_type_visibility(row.Flags);
@@ -1277,60 +1117,46 @@ void dotnet_parse_user_types(
     abstract = (row.Flags & 0x80) != 0;
     sealed = (row.Flags & 0x100) != 0;
 
+    YR_OBJECT* out_obj = ctx->pe->object;
+    set_string(name, out_obj, "classes[%i].name", type_idx - 1);
+    set_string(namespace, out_obj, "classes[%i].namespace", type_idx - 1);
+    set_string(visibility, out_obj, "classes[%i].visibility", type_idx - 1);
+    set_string(type, out_obj, "classes[%i].type", type_idx - 1);
+    set_integer(abstract, out_obj, "classes[%i].abstract", type_idx - 1);
+    set_integer(sealed, out_obj, "classes[%i].sealed", type_idx - 1);
 
-    class_idx = type_idx - 1;  // for output TODO remove, it's confusing
-    set_string(name, pe->object, "classes[%i].name", class_idx);
-    set_string(namespace, pe->object, "classes[%i].namespace", class_idx);
-    set_string(visibility, pe->object, "classes[%i].visibility", class_idx);
-    set_string(type, pe->object, "classes[%i].type", class_idx);
-    set_integer(abstract, pe->object, "classes[%i].abstract", class_idx);
-    set_integer(sealed, pe->object, "classes[%i].sealed", class_idx);
+    dotnet_parse_generic_params(ctx, false, type_idx + 1, &class_gen_params);
 
-    dotnet_parse_generic_params(
-        pe,
-        tables,
-        index_sizes,
-        streams,
-        false,
-        type_idx + 1,
-        &class_gen_params);
     for (i = 0; i < class_gen_params.len; ++i)
     {
       set_string(
           class_gen_params.names[i],
-          pe->object,
+          out_obj,
           "classes[%i].generic_parameters[%i]",
-          class_idx,
+          type_idx - 1,
           i);
     }
 
-    dotnet_get_type_parents(
-        pe,
-        tables,
-        streams,
-        index_sizes,
-        row.Extends,
-        type_idx,
-        &class_gen_params);
+    dotnet_get_type_parents(ctx, row.Extends, type_idx, &class_gen_params);
 
     // get the number of methods
     method_count = 0;
-    if (type_idx + 1 < tables->typedef_.RowCount)
+    if (type_idx + 1 < ctx->tables->typedef_.RowCount)
     {
       TYPEDEF_ROW next_row = {0};
-      data = tables->typedef_.Offset +
-             tables->typedef_.RowSize * (type_idx + 1);
-      read_typedef(data, tables, index_sizes, &next_row);
+      data = ctx->tables->typedef_.Offset +
+             ctx->tables->typedef_.RowSize * (type_idx + 1);
+      read_typedef(ctx, data, &next_row);
 
       // sanity check so we don't overflow
       if (next_row.Method >= row.Method)
         method_count = next_row.Method - row.Method;
     }
-    else if (tables->methoddef.RowCount >= row.Method)
-      method_count = tables->methoddef.RowCount - row.Method;
+    else if (ctx->tables->methoddef.RowCount >= row.Method)
+      method_count = ctx->tables->methoddef.RowCount - row.Method;
 
     dotnet_parse_class_methods(
-        pe, tables, streams, index_sizes, row.Method, method_count, class_idx, &class_gen_params);
+        ctx, row.Method, method_count, type_idx - 1, &class_gen_params);
 
     yr_free(class_gen_params.names);
   }
@@ -2692,9 +2518,15 @@ void dotnet_parse_guid(
 
     matched_bits++;
   }
+  CLASS_PARSING_CONTEXT class_context = {
+      .pe = pe,
+      .tables = &tables,
+      .index_sizes = &index_sizes,
+      .str_heap = pe->data + streams->metadata_root + streams->string->Offset,
+      .blob_heap = pe->data + streams->metadata_root + streams->blob->Offset};
 
-  dotnet_parse_user_types(pe, &tables, &index_sizes, streams);
-}
+  dotnet_parse_user_types(&class_context);
+  }
 
 // Parsing the #~ stream is done in two parts. The first part (this function)
 // parses enough of the Stream to provide context for the second pass. In

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <yara/pe.h>
+#include "yara/pe_utils.h"
 
 #pragma pack(push, 1)
 
@@ -358,24 +359,6 @@ typedef struct _GENERICPARAM_ROW  // ECMA 335 II.22.20
   uint32_t Name;
 } GENERICPARAM_ROW, *PGENERICPARAM_ROW;
 
-// typedef struct _DOTNET_CLASS
-// {
-//   uint32_t index;
-//   uint8_t table;
-//   char** gen_params;
-//   uint32_t gen_params_len;
-// } DOTNET_CLASS, *PDOTNET_CLASS;
-
-// typedef struct _DOTNET_METHOD
-// {
-//   uint32_t index;
-//   uint8_t table;
-//   uint32_t class_index;
-//   uint8_t class_table;
-//   char** gen_params;
-//   uint32_t gen_params_len;
-// } DOTNET_METHOD, *PDOTNET_METHOD;
-
 typedef struct _GENERIC_PARAMETERS
 {
   char** names;
@@ -480,6 +463,15 @@ typedef struct _INDEX_SIZES
   uint8_t assembly;
   uint8_t genericparam;
 } INDEX_SIZES, *PINDEX_SIZES;
+
+typedef struct _CLASS_PARSING_CONTEXT
+{
+  PE* pe;
+  TABLES* tables;
+  INDEX_SIZES* index_sizes;
+  const uint8_t* str_heap;
+  const uint8_t* blob_heap;
+} CLASS_PARSING_CONTEXT, *PCLASS_PARSING_CONTEXT;
 
 #pragma pack(pop)
 #endif

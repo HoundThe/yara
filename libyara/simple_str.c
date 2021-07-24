@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <string.h>
 #include <yara/mem.h>
 #include <yara/simple_str.h>
@@ -22,7 +23,6 @@ SIMPLE_STR* sstr_new(const char* s)
     str->cap = slen;
     memcpy(str->str, s, slen + 1);
   }
-
   return str;
 }
 
@@ -37,8 +37,11 @@ void sstr_free(SIMPLE_STR* str)
 
 bool sstr_appendf(SIMPLE_STR* str, const char* fmt, ...)
 {
-  va_list ap;
+  va_list ap, ap2;
   va_start(ap, fmt);
+  // Create copy because list will get consumed when getting the final length
+  va_copy(ap2, ap);
+
   int size = vsnprintf(NULL, 0, fmt, ap);
   if (size < 0)  // Error
     return false;
@@ -55,7 +58,7 @@ bool sstr_appendf(SIMPLE_STR* str, const char* fmt, ...)
     str->cap = str->len + size + 64;
   }
 
-  vsnprintf(str->str + str->len, str->cap, fmt, ap);
+  str->len += vsnprintf(str->str + str->len, str->cap, fmt, ap2);
 
   va_end(ap);
   return true;
